@@ -37878,10 +37878,42 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
                 "[UE5.6][RT] Skipping FViewportInfo::GetRenderTargetProvider probing because the known texture cannot expose a stable native resource; deferring to D3D12 hooks");
         }
 
+        // FViewportInfo::get_rt_provider re-runs a full 0x500-byte bruteforce
+        // (emulation + hundreds of log lines) every ~2 seconds while it keeps
+        // failing. On titles where it never resolves (e.g. Stupid Never Dies)
+        // that shows up as a hitch every few seconds. Stop probing after a few
+        // failed attempts; behaviour is otherwise identical to a failed probe.
+        static int rt_provider_failures = 0;
+        static std::chrono::steady_clock::time_point rt_provider_last_attempt{};
+        constexpr int rt_provider_max_failures = 5;
+        const bool should_probe_provider =
+            provider_resource == nullptr && known_texture != nullptr && known_texture_is_safe &&
+            rt_provider_failures < rt_provider_max_failures;
+
         const auto viewport_rt_provider =
-            provider_resource == nullptr && known_texture != nullptr && known_texture_is_safe
+            should_probe_provider
                 ? viewport_info->get_rt_provider(known_texture)
                 : nullptr;
+
+        if (should_probe_provider) {
+            if (viewport_rt_provider != nullptr) {
+                rt_provider_failures = 0;
+            } else {
+                const auto now = std::chrono::steady_clock::now();
+
+                // get_rt_provider returns early (cheaply) inside its own 2s retry
+                // window; only count calls that could have re-scanned.
+                if (now - rt_provider_last_attempt >= std::chrono::seconds(2)) {
+                    rt_provider_last_attempt = now;
+                    ++rt_provider_failures;
+
+                    if (rt_provider_failures >= rt_provider_max_failures) {
+                        SPDLOG_WARN("FViewportInfo::GetRenderTargetProvider failed {} times; disabling further probing to stop periodic hitches",
+                            rt_provider_failures);
+                    }
+                }
+            }
+        }
 
         if (viewport_rt_provider != nullptr) {
             provider_resource = viewport_rt_provider->get_viewport_render_target_texture();
