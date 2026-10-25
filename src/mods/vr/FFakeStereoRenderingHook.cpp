@@ -1828,6 +1828,17 @@ bool everwind_is_current_game() {
     return result;
 }
 
+// Stupid Never Dies (UE5.5+): DrawWindow_RenderThread receives
+// FSlateDrawWindowPassInputs in R8 and its pass outputs by hidden storage in RDX.
+bool stupid_never_dies_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && exe_path->find(L"StupidNeverDies") != std::wstring::npos;
+    }();
+
+    return result;
+}
+
 bool stalker2_is_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -6578,6 +6589,7 @@ bool supports_ue55_dedicated_ui_target_for_current_game() {
             pokemon_emerald_is_current_game() ||
             sw_zero_company_ue56_is_current_game() ||
             bodycam_ue554_is_current_game() ||
+            stupid_never_dies_is_current_game() ||
             is_deadzone_ue56_executable()) &&
         g_framework != nullptr &&
         g_framework->is_dx12() &&
@@ -37208,6 +37220,20 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         a4_has_ue_5_5_full_inputs = try_read_ue55_slate_draw_inputs_full(a4, a2, ue55_inputs_full);
         ue55_draw_window_outputs_ptr = renderer;
         SPDLOG_INFO_ONCE("[SlateRHIRenderer::DrawWindow_RenderThread] Using UE 5.5 sret FSlateDrawWindowPassInputs layout");
+    }
+
+    if (!a4_is_ue_5_5_variant && stupid_never_dies_is_current_game() &&
+        try_read_ue55_slate_draw_inputs(a3, renderer, ue55_inputs))
+    {
+        // Stupid Never Dies passes FSlateDrawWindowPassInputs in R8 (first field
+        // == renderer, second == window) and the pass outputs by hidden storage
+        // in RDX; R9 is a small flag. Observed raw arguments:
+        //   rcx=renderer rdx=<zeroed stack outputs> r8=<inputs: renderer, window, ...> r9=1
+        a4_is_ue_5_5_variant = true;
+        a4_has_ue_5_5_full_inputs = try_read_ue55_slate_draw_inputs_full(a3, renderer, ue55_inputs_full);
+        ue55_draw_window_outputs_ptr = a2;
+        SPDLOG_INFO_ONCE("[StupidNeverDies][UE5.5][SlateUI] Using FSlateDrawWindowPassInputs from R8 (outputs in RDX), full_inputs={}",
+            a4_has_ue_5_5_full_inputs);
     }
 
     const bool use_ue55_draw_windows_array_layout =
