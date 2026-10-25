@@ -43777,7 +43777,31 @@ bool VRRenderTargetManager_Base::allocate_render_target_texture(uintptr_t return
                         const auto fn = utility::calculate_absolute(ip + 1);
                         SPDLOG_INFO("Analyzing call at {:x} to {:x}", ip, fn);
 
-                        if (is_ue56_stack_scope_constructor_call(ip)) {
+                        // Some UE5.5+ builds (e.g. Stupid Never Dies) construct
+                        // FName(TEXT("BufferedRT")) right after the string reference.
+                        // That call is the FName constructor, not the texture-create
+                        // function; invoking it with the texture-create ABI derefs
+                        // garbage. Skip any call whose target is a resolved FName helper.
+                        auto known_fname_helper = [](const auto& v) -> uintptr_t {
+                            if constexpr (requires { v.has_value(); v.value(); }) {
+                                return v.has_value() ? (uintptr_t)v.value() : 0;
+                            } else {
+                                return (uintptr_t)v;
+                            }
+                        };
+                        uintptr_t fname_ctor = 0;
+                        uintptr_t fname_to_string = 0;
+                        try {
+                            fname_ctor = known_fname_helper(sdk::FName::get_constructor());
+                            fname_to_string = known_fname_helper(sdk::FName::get_to_string());
+                        } catch (...) {
+                        }
+
+                        if (fn != 0 && (fn == fname_ctor || fn == fname_to_string)) {
+                            SPDLOG_INFO("Call target {:x} is the FName {} (not texture create), skipping this call!",
+                                fn, fn == fname_ctor ? "constructor" : "ToString");
+                            next_call_is_not_the_right_one = true;
+                        } else if (is_ue56_stack_scope_constructor_call(ip)) {
                             // This UE5.6 LLM/scope constructor sits immediately
                             // after AllocateRenderTargetTexture. Hooking it with
                             // the texture-create ABI corrupts the render thread.
