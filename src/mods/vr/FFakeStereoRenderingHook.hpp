@@ -37,6 +37,8 @@
 #include "UE58UIInitialization.hpp"
 #include "UE58OwnedUITexture.hpp"
 #include "GalacticRacerOwnedTexture.hpp"
+#include "utility/BufferedRTTextureCall.hpp"
+#include "StupidNeverDiesUI.hpp"
 #include "NativeFrameDiagnostics.hpp"
 #include "Stalker2NativePolicy.hpp"
 #include "UE57SlateSymbols.hpp"
@@ -198,6 +200,11 @@ public:
     FRHITexture2D*& get_fallback_ui_target_ref() {
         return static_cast<FRHITexture2D*&>(ui_target);
     }
+
+    std::shared_ptr<const uevr::buffered_rt::TextureCall> get_buffered_rt_call() const {
+        return buffered_rt_texture_call.load(std::memory_order_acquire);
+    }
+    FRHITexture2D* get_buffered_rt_ui_target() const { return buffered_rt_ui_owner.get(); }
 
     FRHITexture2D* get_dedicated_ui_target() {
         if (uevr::nascar::is_target()) { return get_ui_target(); }
@@ -497,6 +504,8 @@ protected:
 
     std::vector<uint8_t> texture_create_insn_bytes{};
     std::vector<uint8_t> texture_create_insn_bytes2{};
+    std::atomic<std::shared_ptr<const uevr::buffered_rt::TextureCall>> buffered_rt_texture_call{nullptr};
+    std::unique_ptr<FRHITexture2D, uevr::buffered_rt::ReleaseTexture> buffered_rt_ui_owner{nullptr, {}};
 
     std::optional<size_t> m_viewport_force_separate_rt_offset{};
     bool m_attempted_find_force_separate_rt{false};
@@ -747,6 +756,13 @@ class FFakeStereoRenderingHook : public ModComponent {
 public:
     FFakeStereoRenderingHook();
 
+    // Extent of the original SlateOutputTexture that was last routed to the
+    // dedicated UI target (E-Day only). Slate's projection is built for this
+    // extent, so under Flat3D Native Render + Upscale the UI laid out at the
+    // spoofed half-width client only covers part of the dedicated target.
+    static inline std::atomic<uint32_t> s_routed_slate_original_width{0};
+    static inline std::atomic<uint32_t> s_routed_slate_original_height{0};
+
     VRRenderTargetManager_Base* get_render_target_manager() {
         if (m_uses_ue58_rendertarget_manager) {
             if (m_ue58_rendertarget_manager_abi.load(std::memory_order_acquire) ==
@@ -780,6 +796,7 @@ public:
     void attempt_hooking();
     void attempt_hook_game_engine_tick(uintptr_t return_address = 0);
     void attempt_hook_slate_thread(uintptr_t return_address = 0, bool alternate = false);
+    void attempt_hook_stupid_never_dies_ui();
     void attempt_hook_ue57_slate_elements_pass();
     void attempt_hook_ue55_slate_output_texture_register();
     void attempt_hook_ue58_slate_output_texture_register();
@@ -1287,6 +1304,7 @@ private:
     static void ue57_add_slate_draw_elements_pass_hook(safetyhook::Context& ctx);
     static void slate_output_texture_register_hook_impl(safetyhook::Context& ctx, bool ue58);
     static void ue55_slate_output_texture_register_hook(safetyhook::Context& ctx);
+    static void stupid_never_dies_ui_hook(safetyhook::Context& ctx, bool lookup);
     static void swgr_slate_output_hook(safetyhook::Context& ctx);
     static void swgr_slate_output_restore_hook(safetyhook::Context& ctx);
     static void swgr_bink_overlay_hook(void* viewport_closure, void* commands);
@@ -1296,6 +1314,8 @@ private:
     static void swgr_bink_seek_display_hook(safetyhook::Context& ctx);
     void service_swgr_bink_seek_budget();
     static void* sw_zero_company_ue56_register_external_texture_hook(
+        void* graph_builder, void* texture, const wchar_t* name, uint8_t flags);
+    static void* goweday_register_external_texture_hook(
         void* graph_builder, void* texture, const wchar_t* name, uint8_t flags);
     static void ue58_slate_output_texture_register_hook(safetyhook::Context& ctx);
     static void daysgone_slate_intermediate_buffer_hook(safetyhook::Context& ctx);
@@ -1587,6 +1607,9 @@ private:
     safetyhook::MidHook m_dead_island_ue425_hair_light_indices_hook{};
     safetyhook::InlineHook m_split_fiction_haze_view_builder_hook{};
     safetyhook::InlineHook m_slate_thread_hook{};
+    safetyhook::MidHook m_stupid_never_dies_ui_hook{};
+    safetyhook::MidHook m_stupid_never_dies_ui_lookup_hook{};
+    std::optional<uevr::stupid_never_dies_ui::Call> m_stupid_never_dies_ui_call{};
     std::vector<safetyhook::MidHook> m_ue57_slate_elements_hooks{};
     safetyhook::MidHook m_ue55_slate_output_texture_register_hook{};
     safetyhook::MidHook m_swgr_slate_output_restore_hook{};
@@ -1600,6 +1623,7 @@ private:
     std::atomic_bool m_swgr_bink_seek_enabled{};
     std::atomic_uint64_t m_swgr_bink_budgeted_seeks{}, m_swgr_bink_seek_displays{};
     safetyhook::InlineHook m_sw_zero_company_ue56_slate_output_texture_register_hook{};
+    safetyhook::InlineHook m_goweday_slate_output_texture_register_hook{};
     std::vector<safetyhook::MidHook> m_ue58_slate_output_texture_register_hooks{};
 
     struct UE58SlateUICapabilityDiagnostics {

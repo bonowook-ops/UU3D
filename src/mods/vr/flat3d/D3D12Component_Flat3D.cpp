@@ -832,8 +832,23 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
             // eye RENDER size — a game that renders its scene below native
             // (DLSS/dynamic-res, e.g. Jedi Survivor at 960x540) still draws its
             // UI at the full perceived 1920x1080, so eye_w would crop it too tight.
-            const float cx = eye_slice_w / (float)ui_w;
-            const float cy = eye_slice_h / (float)ui_h;
+            float cx = eye_slice_w / (float)ui_w;
+            float cy = eye_slice_h / (float)ui_h;
+
+            // E-Day routes Slate into a dedicated target whose projection was
+            // built for the original (stereo-packed, double-wide) Slate output,
+            // while the layout uses the spoofed half-width client. The UI then
+            // fills only the top-left perceived/original fraction of the target,
+            // independent of the dedicated target's own pixel size.
+            const auto slate_w = FFakeStereoRenderingHook::s_routed_slate_original_width.load(std::memory_order_relaxed);
+            const auto slate_h = FFakeStereoRenderingHook::s_routed_slate_original_height.load(std::memory_order_relaxed);
+            if (slate_w > 0 && slate_h > 0) {
+                cx = eye_slice_w / (float)slate_w;
+                cy = eye_slice_h / (float)slate_h;
+                SPDLOG_INFO_ONCE("[Flat3D][GoWEDay] UI crop from routed Slate extent {}x{} (eye slice {}x{}) -> {:.3f} x {:.3f}",
+                    slate_w, slate_h, eye_slice_w, eye_slice_h, cx, cy);
+            }
+
             params.ui_crop_x = cx < 1.0f ? cx : 1.0f;
             params.ui_crop_y = cy < 1.0f ? cy : 1.0f;
         } else {
