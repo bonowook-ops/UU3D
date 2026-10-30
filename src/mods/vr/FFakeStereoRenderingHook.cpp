@@ -33654,6 +33654,12 @@ void FFakeStereoRenderingHook::slate_output_texture_register_hook_impl(safetyhoo
         desc->Height,
         (uint32_t)desc->Format);
 
+    static const bool goweday = sdk::gears_eday::current_game();
+    if (goweday) {
+        s_routed_slate_original_width.store((uint32_t)original_desc->Width, std::memory_order_relaxed);
+        s_routed_slate_original_height.store((uint32_t)original_desc->Height, std::memory_order_relaxed);
+    }
+
     ctx.rdx = (uintptr_t)ui_target;
 }
 
