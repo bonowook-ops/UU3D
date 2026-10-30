@@ -836,17 +836,20 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
             float cy = eye_slice_h / (float)ui_h;
 
             // E-Day routes Slate into a dedicated target whose projection was
-            // built for the original (stereo-packed, double-wide) Slate output,
-            // while the layout uses the spoofed half-width client. The UI then
-            // fills only the top-left perceived/original fraction of the target,
-            // independent of the dedicated target's own pixel size.
+            // built for the original Slate output. When that output is the
+            // stereo-packed (double-wide) viewport target, the one-eye layout
+            // fills exactly its left half, whatever the dedicated target's own
+            // size. Do not derive this from the backbuffer: under the client-rect
+            // spoof bb_desc alternates between half and full width, which made
+            // an eye_slice-based ratio swing between 0.25 and 0.5 (tested).
             const auto slate_w = FFakeStereoRenderingHook::s_routed_slate_original_width.load(std::memory_order_relaxed);
             const auto slate_h = FFakeStereoRenderingHook::s_routed_slate_original_height.load(std::memory_order_relaxed);
             if (slate_w > 0 && slate_h > 0) {
-                cx = eye_slice_w / (float)slate_w;
-                cy = eye_slice_h / (float)slate_h;
-                SPDLOG_INFO_ONCE("[Flat3D][GoWEDay] UI crop from routed Slate extent {}x{} (eye slice {}x{}) -> {:.3f} x {:.3f}",
-                    slate_w, slate_h, eye_slice_w, eye_slice_h, cx, cy);
+                const bool packed = (float)slate_w / (float)slate_h >= 2.5f;
+                cx = packed ? 0.5f : 1.0f;
+                cy = 1.0f;
+                SPDLOG_INFO_EVERY_N_SEC(10, "[Flat3D][GoWEDay] UI crop from routed Slate extent {}x{} (packed={}) -> {:.3f} x {:.3f}",
+                    slate_w, slate_h, packed, cx, cy);
             }
 
             params.ui_crop_x = cx < 1.0f ? cx : 1.0f;
