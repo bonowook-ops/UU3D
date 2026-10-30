@@ -1613,7 +1613,6 @@ list(APPEND uevr_SOURCES
 	"src/mods/vr/GalacticRacerNativeFix.hpp"
 	"src/mods/vr/GalacticRacerNativeFixCode.hpp"
 	"src/mods/vr/GalacticRacerOwnedTexture.hpp"
-	"src/mods/vr/GalacticRacerRHICommand.hpp"
 	"src/mods/vr/GalacticRacerRenderTargets.hpp"
 	"src/mods/vr/GameDepthCapture.hpp"
 	"src/mods/vr/GamepadRecovery.hpp"
