@@ -747,13 +747,6 @@ class FFakeStereoRenderingHook : public ModComponent {
 public:
     FFakeStereoRenderingHook();
 
-    // Extent of the original SlateOutputTexture that was last routed to the
-    // dedicated UI target (E-Day only). Slate's projection is built for this
-    // extent, so under Flat3D Native Render + Upscale the UI laid out at the
-    // spoofed half-width client only covers part of the dedicated target.
-    static inline std::atomic<uint32_t> s_routed_slate_original_width{0};
-    static inline std::atomic<uint32_t> s_routed_slate_original_height{0};
-
     VRRenderTargetManager_Base* get_render_target_manager() {
         if (m_uses_ue58_rendertarget_manager) {
             if (m_ue58_rendertarget_manager_abi.load(std::memory_order_acquire) ==

@@ -2,7 +2,6 @@
 #include <DbgHelp.h>
 #include <ShlObj.h>
 #include <TlHelp32.h>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -129,44 +128,6 @@ LONG WINAPI framework::global_exception_handler(struct _EXCEPTION_POINTERS* ei) 
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-// True when rip lies inside kernel32/kernelbase. Access violations there come
-// from the IsBad*Ptr pointer probes (the fault RIP can sit in a split-off chunk
-// of the helper, so a per-function range is not reliable). They are expected,
-// handled by the helper's own SEH, and a real fatal fault there still reaches
-// the unhandled-exception filter.
-static bool is_probe_function_rip(uintptr_t rip) {
-    struct Range {
-        uintptr_t begin{};
-        uintptr_t end{};
-    };
-
-    static const auto ranges = [] {
-        std::array<Range, 2> out{};
-        size_t n = 0;
-
-        for (const auto* module_name : {L"kernel32.dll", L"kernelbase.dll"}) {
-            const auto module = (uintptr_t)GetModuleHandleW(module_name);
-            if (module == 0) {
-                continue;
-            }
-
-            const auto dos = (const IMAGE_DOS_HEADER*)module;
-            const auto nt = (const IMAGE_NT_HEADERS*)(module + dos->e_lfanew);
-            out[n++] = Range{module, module + nt->OptionalHeader.SizeOfImage};
-        }
-
-        return out;
-    }();
-
-    for (const auto& range : ranges) {
-        if (range.begin != 0 && rip >= range.begin && rip < range.end) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
 // First-chance exception logger. A game's own fatal-error handler can terminate
 // the process without our SetUnhandledExceptionFilter ever running, so we log
 // every genuine error-class exception (and breakpoints — UE check()/fatal
@@ -200,39 +161,12 @@ static LONG WINAPI first_chance_exception_logger(struct _EXCEPTION_POINTERS* ei)
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    const auto rip = ei->ContextRecord->Rip;
-
-    // IsBadReadPtr-style probes fault by design and are handled by the probe's
-    // own SEH. UEVR/UU3D validation raises them in storms (190k+ in a few
-    // seconds on SW Zero Company), so drop them before touching any lock or the
-    // logger: logging from inside those faults is the suspected cause of the
-    // hang that title shows right after the storm.
-    if (code == EXCEPTION_ACCESS_VIOLATION && is_probe_function_rip(rip)) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-
-    // A pure reporter must never block a faulting thread. Skip reentrant faults
-    // (an exception raised while this thread is already logging) and never wait
-    // for another thread that is mid-log: waiting here, while the faulting
-    // thread may hold heap/loader/logger locks, can deadlock the whole process.
-    thread_local bool in_logger = false;
-    if (in_logger) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-
     static std::mutex log_mtx{};
     static std::unordered_map<uint64_t, uint64_t> seen_counts{};
 
-    std::unique_lock _{log_mtx, std::try_to_lock};
-    if (!_.owns_lock()) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
+    std::scoped_lock _{log_mtx};
 
-    in_logger = true;
-    struct ResetInLogger {
-        ~ResetInLogger() { in_logger = false; }
-    } reset_in_logger{};
-
+    const auto rip = ei->ContextRecord->Rip;
     const auto key = (uint64_t)rip ^ ((uint64_t)code << 32);
     const auto count = ++seen_counts[key];
 
