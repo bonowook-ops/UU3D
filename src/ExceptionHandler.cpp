@@ -1187,7 +1187,7 @@ void framework::swzc_diag_init() {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc0);
 
-    const auto path = (Framework::get_persistent_dir() / "swzc_fix1.txt").wstring();
+    const auto path = (Framework::get_persistent_dir() / "swzc_fix2.txt").wstring();
     DeleteFileW(path.c_str());
     g_file = CreateFileW(path.c_str(), FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1203,7 +1203,7 @@ void framework::swzc_diag_init() {
 
     {
         auto l = begin_line();
-        l.s("[FIX1] uu3d-swzc-fix1 side log (diag2 logging kept), pid ").dec(GetCurrentProcessId())
+        l.s("[FIX2] uu3d-swzc-fix2 side log (diag2 logging kept), pid ").dec(GetCurrentProcessId())
             .s(". Times are seconds since this line.");
         write(l);
     }

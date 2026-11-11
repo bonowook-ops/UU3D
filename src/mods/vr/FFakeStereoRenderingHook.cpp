@@ -7544,6 +7544,49 @@ bool ue55_dx12_try_get_native_resource_direct(
     return false;
 }
 
+bool sw_zero_company_flat3d_native_resource_impl(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                                 ID3D12Resource*& out_native)
+{
+    out_native = nullptr;
+
+    if (!sw_zero_company_ue56_is_current_game() || !is_ue_5_6_dx12_backend()) {
+        return false;
+    }
+
+    if (texture == nullptr) {
+        return true;
+    }
+
+    if (is_ui_target && g_hook != nullptr) {
+        if (auto* const rtm = g_hook->get_render_target_manager(); rtm != nullptr) {
+            ID3D12Resource* pinned{};
+            if (rtm->try_get_sw_zero_company_pinned_ui_resource(texture, pinned)) {
+                out_native = pinned;
+                return true;
+            }
+        }
+    }
+
+    // Only the byte-validated slot-5 accessor; never a blind slot probe.
+    const auto* const layout = sw_zero_company_ue56_binary_layout();
+    if (layout == nullptr || layout->native_resource == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(5,
+            "[SWZeroCompany][UE5.6][Flat3D] No validated GetNativeResource layout for {}; not probing tex={:x}",
+            source != nullptr ? source : "<unknown>", reinterpret_cast<uintptr_t>(texture));
+        return true;
+    }
+
+    ID3D12Resource* native{};
+    if (ue55_dx12_try_get_native_resource_direct(texture, source, &native, nullptr)) {
+        out_native = native;
+    }
+
+    SPDLOG_INFO_ONCE(
+        "[SWZeroCompany][UE5.6][Flat3D] Using the validated GetNativeResource accessor for Flat3D output; "
+        "the SDK's generic slot discovery is not used");
+    return true;
+}
+
 constexpr std::string_view BODYCAM_UE554_SCENE_VIEWPORT_SOURCE =
     "Bodycam FSceneViewport::InitRHI post";
 
@@ -9744,6 +9787,15 @@ std::optional<uint32_t> resolve_post_init_properties_index_from_uobject(uintptr_
     SPDLOG_WARN("[PostInitProperties] Could not validate the expected UObject::PostInitProperties slots on this build");
     return std::nullopt;
 }
+}
+
+// External entry point (declared in FFakeStereoRenderingHook.hpp) for the
+// Flat3D output path; the implementation lives in this file's anonymous
+// namespace next to the validated accessor it uses.
+bool sw_zero_company_flat3d_native_resource(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                            ID3D12Resource*& out_native)
+{
+    return sw_zero_company_flat3d_native_resource_impl(texture, source, is_ui_target, out_native);
 }
 
 namespace {

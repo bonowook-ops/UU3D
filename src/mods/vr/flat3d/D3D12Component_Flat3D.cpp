@@ -14,6 +14,7 @@
 #include "../GameDepthCapture.hpp"
 
 #include "../D3D12Component.hpp"
+#include "../FFakeStereoRenderingHook.hpp"
 
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
@@ -633,6 +634,20 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
 vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     auto& hook = g_framework->get_d3d12_hook();
 
+    // SW Zero Company: resolve every native resource through the validated
+    // accessor; the generic getter's discovery faults forever on this build
+    // (see sw_zero_company_flat3d_native_resource). Other games: unchanged.
+    const auto native_of = [](FRHITexture2D* texture, const char* source, bool is_ui_target) -> ID3D12Resource* {
+        if (texture == nullptr) {
+            return nullptr;
+        }
+        ID3D12Resource* native{};
+        if (sw_zero_company_flat3d_native_resource(texture, source, is_ui_target, native)) {
+            return native;
+        }
+        return (ID3D12Resource*)texture->get_native_resource();
+    };
+
     // Leave the game's vsync alone (interlaced modes need tear-free scanout).
 
     auto device = hook->get_device();
@@ -668,7 +683,7 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
         const auto ue4_texture = vr->m_fake_stereo_hook->get_render_target_manager()->get_render_target();
 
         if (ue4_texture != nullptr) {
-            double_wide = (ID3D12Resource*)ue4_texture->get_native_resource();
+            double_wide = native_of(ue4_texture, "Flat3D scene target", false);
         }
     }
 
@@ -732,7 +747,7 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     if (params.native_stereo_layout) {
         const auto scene_capture = vr->m_fake_stereo_hook->get_render_target_manager()->get_scene_capture_render_target();
         if (scene_capture != nullptr) {
-            right_eye_src = (ID3D12Resource*)scene_capture->get_native_resource();
+            right_eye_src = native_of(scene_capture, "Flat3D scene capture", false);
         }
 
         // A stale capture (pre-resolution-change, mid-recreation) renders
@@ -753,7 +768,7 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     const auto ui_target = vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target();
 
     if (ui_target != nullptr) {
-        ui_tex = (ID3D12Resource*)ui_target->get_native_resource();
+        ui_tex = native_of(ui_target, "Flat3D UI target", true);
     }
 
     // The UI target must match the size the ENGINE draws Slate at — its own
@@ -808,9 +823,8 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
         const float scene_aspect = eye_h > 0 ? (float)eye_w / (float)eye_h : 0.0f;
 
         uint64_t ui_w = 0; uint32_t ui_h = 0; float ui_aspect = 0.0f;
-        if (auto* ui_native = (ID3D12Resource*)(vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target()
-                                    ? vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target()->get_native_resource()
-                                    : nullptr)) {
+        if (auto* ui_native = native_of(vr->m_fake_stereo_hook->get_render_target_manager()->get_ui_target(),
+                                        "Flat3D UI aspect", true)) {
             const auto d = ui_native->GetDesc();
             ui_w = d.Width; ui_h = d.Height;
             ui_aspect = ui_h > 0 ? (float)ui_w / (float)ui_h : 0.0f;
