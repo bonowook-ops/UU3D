@@ -41,7 +41,7 @@ struct SwzcCopyNote {
     unsigned long long trusted_w, trusted_h;
     unsigned long long src_w, src_h, dst_w, dst_h;
     unsigned long long src_fmt, dst_fmt, src_flags, dst_flags;
-    unsigned long long src_depth, dst_depth, src_mips, dst_mips, src_layout, dst_layout, src_samples, dst_samples;
+    unsigned long long src_depth, dst_depth, src_mips, dst_mips, src_layout, dst_layout, src_samples, dst_samples, src_quality, dst_quality;
     unsigned long long src_res, dst_res;
     int hmd_active;
 };

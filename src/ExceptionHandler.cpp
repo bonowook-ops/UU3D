@@ -1187,7 +1187,7 @@ void framework::swzc_diag_init() {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc0);
 
-    const auto path = (Framework::get_persistent_dir() / "swzc_diag2.txt").wstring();
+    const auto path = (Framework::get_persistent_dir() / "swzc_fix1.txt").wstring();
     DeleteFileW(path.c_str());
     g_file = CreateFileW(path.c_str(), FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1203,7 +1203,7 @@ void framework::swzc_diag_init() {
 
     {
         auto l = begin_line();
-        l.s("[DIAG2] uu3d-swzc-diag2 side log, pid ").dec(GetCurrentProcessId())
+        l.s("[FIX1] uu3d-swzc-fix1 side log (diag2 logging kept), pid ").dec(GetCurrentProcessId())
             .s(". Times are seconds since this line.");
         write(l);
     }
@@ -1341,9 +1341,9 @@ void framework::swzc_diag_note_copy(const SwzcCopyNote& n) {
         .s(" trusted_desktop=").dec(n.trusted_w).s("x").dec(n.trusted_h)
         .s(" src=").hex(n.src_res).s(" ").dec(n.src_w).s("x").dec(n.src_h).s(" fmt ").dec(n.src_fmt).s(" flags ")
         .hex(n.src_flags).s(" arr ").dec(n.src_depth).s(" mips ").dec(n.src_mips).s(" layout ").dec(n.src_layout)
-        .s(" ms ").dec(n.src_samples)
+        .s(" ms ").dec(n.src_samples).s(".").dec(n.src_quality)
         .s(" dst=").hex(n.dst_res).s(" ").dec(n.dst_w).s("x").dec(n.dst_h).s(" fmt ").dec(n.dst_fmt).s(" flags ")
         .hex(n.dst_flags).s(" arr ").dec(n.dst_depth).s(" mips ").dec(n.dst_mips).s(" layout ").dec(n.dst_layout)
-        .s(" ms ").dec(n.dst_samples);
+        .s(" ms ").dec(n.dst_samples).s(".").dec(n.dst_quality);
     write(l);
 }

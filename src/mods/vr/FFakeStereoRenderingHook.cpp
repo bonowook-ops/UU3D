@@ -2994,6 +2994,7 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
             n.src_mips = src_d->MipLevels;
             n.src_layout = (uint64_t)src_d->Layout;
             n.src_samples = src_d->SampleDesc.Count;
+            n.src_quality = src_d->SampleDesc.Quality;
         }
         if (dst_d != nullptr) {
             n.dst_w = dst_d->Width;
@@ -3004,6 +3005,7 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
             n.dst_mips = dst_d->MipLevels;
             n.dst_layout = (uint64_t)dst_d->Layout;
             n.dst_samples = dst_d->SampleDesc.Count;
+            n.dst_quality = dst_d->SampleDesc.Quality;
         }
         if (src_location != nullptr &&
             is_readable_process_range(reinterpret_cast<uintptr_t>(src_location), sizeof(*src_location)))
@@ -3086,7 +3088,10 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
         src_desc.Width == packed_width && src_desc.Height == packed_height &&
         dst_desc.Width == trusted_desktop_width &&
         dst_desc.Height == trusted_desktop_height &&
-        src_desc.Width > dst_desc.Width && src_desc.Height > dst_desc.Height &&
+        // Height may be equal: on a flat 3D display (UU3D Flat3D) each eye is
+        // rendered at the desktop height, so the packed source is wider but
+        // not taller, and the full-box copy is just as invalid (diag2).
+        src_desc.Width > dst_desc.Width && src_desc.Height >= dst_desc.Height &&
         src_desc.DepthOrArraySize == 1 && dst_desc.DepthOrArraySize == 1 &&
         src_desc.MipLevels == 1 && dst_desc.MipLevels == 1 &&
         src_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
