@@ -2,7 +2,10 @@
 #include <DbgHelp.h>
 #include <ShlObj.h>
 #include <TlHelp32.h>
+#include <Psapi.h>
+#include <algorithm>
 #include <atomic>
+#include <cwctype>
 #include <chrono>
 #include <filesystem>
 #include <format>
@@ -39,6 +42,9 @@ LONG WINAPI framework::global_exception_handler(struct _EXCEPTION_POINTERS* ei) 
     if (is_module_detaching()) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+
+    // diag1 (SWZeroCompany only): raw line first, in case spdlog is what is stuck.
+    framework::swzc_diag_note_unhandled(ei);
 
     spdlog::flush_on(spdlog::level::err);
 
@@ -356,6 +362,9 @@ void framework::setup_exception_handler() {
             g_messagebox_w_hook = safetyhook::create_inline((void*)fn, (void*)&messagebox_w_hooked);
         }
     }
+
+    // diag1: no-op unless the host is SWZeroCompany.exe; runs once.
+    swzc_diag_init();
 }
 
 // --- Hang diagnostics --------------------------------------------------------
@@ -525,4 +534,662 @@ void framework::dump_all_thread_stacks(const char* reason) {
     if (const auto logger = spdlog::default_logger()) {
         logger->flush();
     }
+}
+
+// --- SW Zero Company diagnostic build (diag1) --------------------------------
+// Purpose: find out what kills SWZeroCompany.exe right after Flat3D's native
+// resize nudge runs engine->exec("r.SetRes ...") for the first time (the
+// UEngine::Exec discovery scan). Observation only: nothing here changes what
+// the game or the backend does. Everything is gated on the host executable
+// being SWZeroCompany.exe.
+//
+// The side log is written with raw WriteFile on an append-only handle and a
+// fixed-size, CRT-free line formatter, never through spdlog: the 00053 log
+// showed another thread's once-a-second spdlog line stalling for 4.3 s during
+// the fatal window, so spdlog (or a lock it needs) may itself be what is stuck.
+namespace {
+namespace swzc_diag {
+std::atomic_bool g_enabled{false};
+HANDLE g_file{INVALID_HANDLE_VALUE};
+LARGE_INTEGER g_qpf{};
+LARGE_INTEGER g_qpc0{};
+
+std::atomic<uint64_t> g_exec_begin_us{0};
+std::atomic<uint32_t> g_exec_tid{0};
+std::atomic<int32_t> g_exec_depth{0};
+std::atomic<uint32_t> g_exec_count{0};
+std::atomic_bool g_veh_active{false};
+std::atomic<uint64_t> g_head_n{0};
+std::atomic<uint64_t> g_tail_n{0};
+std::atomic<uint64_t> g_head_k32{0};
+std::atomic<uint64_t> g_tail_k32{0};
+std::atomic<uint32_t> g_veh_lines{0};
+
+uintptr_t g_k32_base{0}, g_k32_end{0};
+uintptr_t g_kb_base{0}, g_kb_end{0};
+
+uint64_t now_us() {
+    LARGE_INTEGER c{};
+    QueryPerformanceCounter(&c);
+    if (g_qpf.QuadPart == 0) {
+        return 0;
+    }
+    return (uint64_t)((c.QuadPart - g_qpc0.QuadPart) * 1000000 / g_qpf.QuadPart);
+}
+
+struct Line {
+    char buf[1024];
+    size_t n{0};
+
+    Line& s(const char* str) {
+        while (str != nullptr && *str != '\0' && n < sizeof(buf) - 2) {
+            buf[n++] = *str++;
+        }
+        return *this;
+    }
+    Line& hex(uint64_t v) {
+        char t[17];
+        int i = 16;
+        t[16] = '\0';
+        do {
+            t[--i] = "0123456789abcdef"[v & 15];
+            v >>= 4;
+        } while (v != 0 && i > 0);
+        return s(t + i);
+    }
+    Line& dec(uint64_t v) {
+        char t[21];
+        int i = 20;
+        t[20] = '\0';
+        do {
+            t[--i] = (char)('0' + (v % 10));
+            v /= 10;
+        } while (v != 0 && i > 0);
+        return s(t + i);
+    }
+    Line& w(std::wstring_view ws) {
+        for (size_t k = 0; k < ws.size() && k < 200 && n < sizeof(buf) - 2; ++k) {
+            const auto c = ws[k];
+            buf[n++] = (c >= 32 && c < 127) ? (char)c : '?';
+        }
+        return *this;
+    }
+};
+
+Line begin_line() {
+    Line l{};
+    const auto t = now_us();
+    l.s("[").dec(t / 1000000).s(".");
+    const auto frac = t % 1000000;
+    for (uint64_t d = 100000; d > 0; d /= 10) {
+        l.buf[l.n++] = (char)('0' + (frac / d) % 10);
+    }
+    l.s("] t").dec(GetCurrentThreadId()).s(" ");
+    return l;
+}
+
+void write(Line& l) {
+    if (g_file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    l.buf[l.n++] = '\n';
+    DWORD written = 0;
+    WriteFile(g_file, l.buf, (DWORD)l.n, &written, nullptr);
+}
+
+struct Mod {
+    uintptr_t base;
+    uintptr_t size;
+    char name[48];
+};
+struct ModTable {
+    Mod mods[768];
+    uint32_t count;
+};
+ModTable g_tables[2]{};
+std::atomic<int> g_cur_table{-1};
+std::mutex g_refresh_mtx{};
+
+// Only called from normal contexts (never from a VEH or while a thread is
+// suspended): the psapi calls take the loader's module list lock.
+void refresh_modules() {
+    std::scoped_lock _{g_refresh_mtx};
+    const int next = g_cur_table.load(std::memory_order_acquire) == 0 ? 1 : 0;
+    auto& t = g_tables[next];
+    HMODULE handles[768]{};
+    DWORD needed = 0;
+
+    if (!K32EnumProcessModules(GetCurrentProcess(), handles, sizeof(handles), &needed)) {
+        return;
+    }
+
+    const auto count = (uint32_t)(std::min<size_t>)(needed / sizeof(HMODULE), 768);
+    t.count = 0;
+
+    for (uint32_t i = 0; i < count; ++i) {
+        MODULEINFO mi{};
+        if (!K32GetModuleInformation(GetCurrentProcess(), handles[i], &mi, sizeof(mi))) {
+            continue;
+        }
+        auto& m = t.mods[t.count++];
+        m.base = (uintptr_t)mi.lpBaseOfDll;
+        m.size = mi.SizeOfImage;
+        char name[MAX_PATH]{};
+        K32GetModuleBaseNameA(GetCurrentProcess(), handles[i], name, sizeof(name));
+        size_t k = 0;
+        for (; name[k] != '\0' && k < sizeof(m.name) - 1; ++k) {
+            m.name[k] = name[k];
+        }
+        m.name[k] = '\0';
+    }
+
+    g_cur_table.store(next, std::memory_order_release);
+}
+
+const Mod* find_module(uintptr_t addr) {
+    const auto idx = g_cur_table.load(std::memory_order_acquire);
+    if (idx < 0) {
+        return nullptr;
+    }
+    const auto& t = g_tables[idx];
+    for (uint32_t i = 0; i < t.count && i < 768; ++i) {
+        if (addr >= t.mods[i].base && addr < t.mods[i].base + t.mods[i].size) {
+            return &t.mods[i];
+        }
+    }
+    return nullptr;
+}
+
+Line& describe(Line& l, uintptr_t addr) {
+    l.hex(addr);
+    if (const auto m = find_module(addr); m != nullptr) {
+        l.s("(").s(m->name).s("+").hex(addr - m->base).s(")");
+    }
+    return l;
+}
+
+bool read_mem(uintptr_t addr, void* out, size_t size) {
+    SIZE_T got = 0;
+    return addr >= 0x10000 &&
+           ReadProcessMemory(GetCurrentProcess(), (const void*)addr, out, size, &got) != FALSE && got == size;
+}
+
+bool in_kernel32(uintptr_t rip) {
+    return (rip >= g_k32_base && rip < g_k32_end) || (rip >= g_kb_base && rip < g_kb_end);
+}
+
+// Copies the thread's state while it is suspended and formats only after it is
+// resumed. Nothing between SuspendThread and ResumeThread allocates or locks.
+void sample_thread(DWORD tid, const char* tag, size_t max_frames) {
+    const auto thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+
+    if (thread == nullptr) {
+        auto l = begin_line();
+        l.s(tag).s(" tid ").dec(tid).s(" OpenThread failed ").dec(GetLastError());
+        write(l);
+        return;
+    }
+
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    uint8_t stack[0x1000];
+    SIZE_T stack_read = 0;
+    bool have_ctx = false;
+    const DWORD prev = SuspendThread(thread);
+
+    if (prev != (DWORD)-1) {
+        have_ctx = GetThreadContext(thread, &ctx) != FALSE;
+        if (have_ctx) {
+            ReadProcessMemory(GetCurrentProcess(), (const void*)ctx.Rsp, stack, sizeof(stack), &stack_read);
+        }
+        ResumeThread(thread);
+    }
+
+    CloseHandle(thread);
+
+    if (!have_ctx) {
+        auto l = begin_line();
+        l.s(tag).s(" tid ").dec(tid).s(" no context (suspend=").hex(prev).s(")");
+        write(l);
+        return;
+    }
+
+    {
+        auto l = begin_line();
+        l.s(tag).s(" tid ").dec(tid).s(" RIP ");
+        describe(l, ctx.Rip).s(" RSP ").hex(ctx.Rsp).s(" prev_suspend ").dec(prev);
+        write(l);
+    }
+    {
+        auto l = begin_line();
+        l.s(tag).s("   RAX ").hex(ctx.Rax).s(" RBX ").hex(ctx.Rbx).s(" RCX ").hex(ctx.Rcx).s(" RDX ").hex(ctx.Rdx)
+            .s(" RSI ").hex(ctx.Rsi).s(" RDI ").hex(ctx.Rdi).s(" R8 ").hex(ctx.R8).s(" R9 ").hex(ctx.R9)
+            .s(" R12 ").hex(ctx.R12).s(" R13 ").hex(ctx.R13).s(" R14 ").hex(ctx.R14).s(" R15 ").hex(ctx.R15);
+        write(l);
+    }
+
+    size_t logged = 0;
+    Line fl = begin_line();
+    fl.s(tag).s("   frames:");
+
+    for (size_t off = 0; off + sizeof(uintptr_t) <= stack_read && logged < max_frames; off += sizeof(uintptr_t)) {
+        uintptr_t value{};
+        memcpy(&value, stack + off, sizeof(value));
+
+        if (value < 0x10000 || find_module(value) == nullptr) {
+            continue;
+        }
+
+        if (fl.n > sizeof(fl.buf) - 120) {
+            write(fl);
+            fl = begin_line();
+            fl.s(tag).s("   frames:");
+        }
+
+        fl.s(" [").hex(off).s("]");
+        describe(fl, value);
+        ++logged;
+    }
+
+    write(fl);
+}
+
+void dump_all_threads(const char* reason) {
+    {
+        auto l = begin_line();
+        l.s("[ALLTHREADS] begin: ").s(reason);
+        write(l);
+    }
+
+    const auto self = GetCurrentThreadId();
+    const auto pid = GetCurrentProcessId();
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        auto l = begin_line();
+        l.s("[ALLTHREADS] snapshot failed ").dec(GetLastError());
+        write(l);
+        return;
+    }
+
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    uint32_t n = 0;
+
+    for (auto ok = Thread32First(snapshot, &entry); ok; ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) {
+            continue;
+        }
+        sample_thread(entry.th32ThreadID, "[ALLTHREADS]", 10);
+        ++n;
+    }
+
+    CloseHandle(snapshot);
+
+    auto l = begin_line();
+    l.s("[ALLTHREADS] end, threads=").dec(n);
+    write(l);
+}
+
+DWORD WINAPI watchdog_thread(void*) {
+    uint64_t tick = 0;
+    bool dumped_1s = false;
+    bool dumped_3s = false;
+    uint32_t dumped_for_exec = 0;
+
+    for (;;) {
+        Sleep(250);
+        ++tick;
+
+        const auto begin = g_exec_begin_us.load(std::memory_order_acquire);
+        const auto now = now_us();
+        const bool active = begin != 0 && now - begin < 20 * 1000000ull;
+
+        if (!active) {
+            if (tick % 4 == 0) {
+                auto l = begin_line();
+                l.s("[HB] idle execs=").dec(g_exec_count.load());
+                write(l);
+            }
+            if (tick % 8 == 0) {
+                refresh_modules();
+            }
+            continue;
+        }
+
+        const auto exec_no = g_exec_count.load();
+        if (dumped_for_exec != exec_no) {
+            dumped_for_exec = exec_no;
+            dumped_1s = false;
+            dumped_3s = false;
+        }
+
+        const auto elapsed_ms = (now - begin) / 1000;
+        const auto depth = g_exec_depth.load();
+
+        {
+            auto l = begin_line();
+            l.s("[HB] exec#").dec(exec_no).s(" since_begin_ms=").dec(elapsed_ms).s(" inside_exec=")
+                .dec(depth > 0 ? 1 : 0).s(" veh_head=").dec(g_head_n.load()).s(" veh_tail=").dec(g_tail_n.load())
+                .s(" k32_head=").dec(g_head_k32.load()).s(" k32_tail=").dec(g_tail_k32.load());
+            write(l);
+        }
+
+        if (const auto tid = g_exec_tid.load(); tid != 0 && tid != GetCurrentThreadId()) {
+            sample_thread(tid, "[GAMETHREAD]", 24);
+        }
+
+        if (depth > 0 && !dumped_1s && elapsed_ms >= 1000) {
+            dumped_1s = true;
+            dump_all_threads("exec still running after 1 s");
+        }
+        if (depth > 0 && !dumped_3s && elapsed_ms >= 3000) {
+            dumped_3s = true;
+            dump_all_threads("exec still running after 3 s");
+        }
+    }
+}
+
+LONG veh_common(PEXCEPTION_POINTERS ei, bool head) {
+    if (framework::is_module_detaching() || !g_veh_active.load(std::memory_order_acquire)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto code = ei->ExceptionRecord->ExceptionCode;
+    const bool interesting = (code & 0xF0000000u) == 0xC0000000u || code == 1 || code == EXCEPTION_BREAKPOINT ||
+                             code == 0xE06D7363u /* C++ throw */;
+
+    if (!interesting) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto rip = (uintptr_t)ei->ContextRecord->Rip;
+    const char* tag = head ? "[VEH-HEAD]" : "[VEH-TAIL]";
+
+    if (code == EXCEPTION_ACCESS_VIOLATION && in_kernel32(rip)) {
+        const auto c = ++(head ? g_head_k32 : g_tail_k32);
+        if (c % 500 == 0) {
+            auto l = begin_line();
+            l.s(tag).s(" kernel32 AV (IsBadReadPtr) x").dec(c);
+            write(l);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto n = ++(head ? g_head_n : g_tail_n);
+
+    if (g_veh_lines.fetch_add(1) < 6000) {
+        auto l = begin_line();
+        l.s(tag).s(" #").dec(n).s(" code ").hex(code).s(" RIP ");
+        describe(l, rip);
+        if (code == EXCEPTION_ACCESS_VIOLATION && ei->ExceptionRecord->NumberParameters >= 2) {
+            l.s(" av_kind ").dec(ei->ExceptionRecord->ExceptionInformation[0]).s(" addr ")
+                .hex(ei->ExceptionRecord->ExceptionInformation[1]);
+        }
+        l.s(" RSP ").hex(ei->ContextRecord->Rsp).s(" exec_depth ").dec((uint64_t)(std::max)(0, (int)g_exec_depth.load()));
+        write(l);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+LONG WINAPI veh_head(PEXCEPTION_POINTERS ei) { return veh_common(ei, true); }
+LONG WINAPI veh_tail(PEXCEPTION_POINTERS ei) { return veh_common(ei, false); }
+
+void log_backtrace(const char* tag) {
+    void* frames[48]{};
+    const auto n = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+    Line l = begin_line();
+    l.s(tag).s(" backtrace:");
+    for (USHORT i = 0; i < n; ++i) {
+        if (l.n > sizeof(l.buf) - 120) {
+            write(l);
+            l = begin_line();
+            l.s(tag).s(" backtrace:");
+        }
+        l.s(" ");
+        describe(l, (uintptr_t)frames[i]);
+    }
+    write(l);
+}
+
+safetyhook::InlineHook g_rtl_exit_hook{};
+safetyhook::InlineHook g_terminate_hook{};
+safetyhook::InlineHook g_failfast_hook{};
+
+void NTAPI rtl_exit_user_process_hooked(LONG status) {
+    auto l = begin_line();
+    l.s("[TERM] RtlExitUserProcess status ").hex((uint32_t)status);
+    write(l);
+    log_backtrace("[TERM] RtlExitUserProcess");
+    g_rtl_exit_hook.call<void>(status);
+}
+
+BOOL WINAPI terminate_process_hooked(HANDLE process, UINT code) {
+    auto l = begin_line();
+    l.s("[TERM] TerminateProcess handle ").hex((uint64_t)process).s(" code ").hex(code);
+    write(l);
+    log_backtrace("[TERM] TerminateProcess");
+    return g_terminate_hook.call<BOOL>(process, code);
+}
+
+void WINAPI raise_fail_fast_hooked(PEXCEPTION_RECORD record, PCONTEXT context, DWORD flags) {
+    auto l = begin_line();
+    l.s("[TERM] RaiseFailFastException flags ").hex(flags);
+    if (record != nullptr) {
+        l.s(" code ").hex(record->ExceptionCode).s(" addr ");
+        describe(l, (uintptr_t)record->ExceptionAddress);
+    }
+    if (context != nullptr) {
+        l.s(" ctx_rip ");
+        describe(l, (uintptr_t)context->Rip);
+    }
+    write(l);
+    log_backtrace("[TERM] RaiseFailFastException");
+    g_failfast_hook.call<void>(record, context, flags);
+}
+
+void module_range(const wchar_t* name, uintptr_t& base, uintptr_t& end) {
+    const auto mod = GetModuleHandleW(name);
+    MODULEINFO mi{};
+    if (mod != nullptr && K32GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) {
+        base = (uintptr_t)mi.lpBaseOfDll;
+        end = base + mi.SizeOfImage;
+    }
+}
+
+void install_hook(safetyhook::InlineHook& hook, const wchar_t* module, const char* export_name, void* detour) {
+    const auto mod = GetModuleHandleW(module);
+    const auto fn = mod != nullptr ? (void*)GetProcAddress(mod, export_name) : nullptr;
+    auto l = begin_line();
+    l.s("[DIAG1] hook ").s(export_name).s(" at ");
+    if (fn == nullptr) {
+        l.s("<not found>");
+        write(l);
+        return;
+    }
+    describe(l, (uintptr_t)fn);
+    {
+        // Written before installing, so a failure during installation is visible.
+        auto pre = begin_line();
+        pre.s("[DIAG1] installing hook ").s(export_name);
+        write(pre);
+    }
+    hook = safetyhook::create_inline(fn, detour);
+    l.s(hook ? " installed" : " FAILED");
+    write(l);
+}
+
+bool is_swzc_executable() {
+    wchar_t path[MAX_PATH]{};
+    const auto len = GetModuleFileNameW(nullptr, path, MAX_PATH);
+    const std::wstring_view view{path, len};
+    const std::wstring_view suffix{L"\\swzerocompany.exe"};
+    if (view.size() < suffix.size()) {
+        return false;
+    }
+    const auto tail = view.substr(view.size() - suffix.size());
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        if ((wchar_t)towlower(tail[i]) != suffix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void dump_engine_object(const void* engine) {
+    auto l = begin_line();
+    l.s("[ENGINE] UEngine object ").hex((uintptr_t)engine).s(" (the Exec scan walks qwords +0..+0x100 as vtables)");
+    write(l);
+
+    for (uintptr_t off = 0; off <= 0x100; off += sizeof(void*)) {
+        uintptr_t q{};
+        auto el = begin_line();
+        el.s("[ENGINE] +").hex(off).s(" = ");
+        if (!read_mem((uintptr_t)engine + off, &q, sizeof(q))) {
+            el.s("<unreadable>");
+            write(el);
+            continue;
+        }
+        describe(el, q);
+        uintptr_t entries[4]{};
+        if (q != 0 && read_mem(q, entries, sizeof(entries))) {
+            el.s(" vt:");
+            for (auto e : entries) {
+                el.s(" ");
+                describe(el, e);
+            }
+        }
+        write(el);
+    }
+}
+} // namespace swzc_diag
+} // namespace
+
+bool framework::swzc_diag_enabled() {
+    return swzc_diag::g_enabled.load(std::memory_order_acquire);
+}
+
+void framework::swzc_diag_init() {
+    using namespace swzc_diag;
+    static std::atomic_bool once{false};
+
+    if (once.exchange(true)) {
+        return;
+    }
+
+    if (!is_swzc_executable()) {
+        return;
+    }
+
+    QueryPerformanceFrequency(&g_qpf);
+    QueryPerformanceCounter(&g_qpc0);
+
+    const auto path = (Framework::get_persistent_dir() / "swzc_diag1.txt").wstring();
+    DeleteFileW(path.c_str());
+    g_file = CreateFileW(path.c_str(), FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (g_file == INVALID_HANDLE_VALUE) {
+        spdlog::error("[SWZC diag1] could not open side log ({})", GetLastError());
+        return;
+    }
+
+    module_range(L"kernel32.dll", g_k32_base, g_k32_end);
+    module_range(L"kernelbase.dll", g_kb_base, g_kb_end);
+    refresh_modules();
+
+    {
+        auto l = begin_line();
+        l.s("[DIAG1] uu3d-swzc-diag1 side log, pid ").dec(GetCurrentProcessId())
+            .s(". Times are seconds since this line.");
+        write(l);
+    }
+
+    g_enabled.store(true, std::memory_order_release);
+
+    // NtTerminateProcess is deliberately NOT hooked: it is an ntdll syscall stub
+    // and installing an inline hook there kills the process (verified in a
+    // standalone smoke test). RtlExitUserProcess + TerminateProcess +
+    // RaiseFailFastException cover the ordinary ways a process ends itself.
+    install_hook(g_rtl_exit_hook, L"ntdll.dll", "RtlExitUserProcess", (void*)&rtl_exit_user_process_hooked);
+    install_hook(g_terminate_hook, L"kernelbase.dll", "TerminateProcess", (void*)&terminate_process_hooked);
+    install_hook(g_failfast_hook, L"kernelbase.dll", "RaiseFailFastException", (void*)&raise_fail_fast_hooked);
+
+    if (const auto th = CreateThread(nullptr, 0, &watchdog_thread, nullptr, 0, nullptr); th != nullptr) {
+        CloseHandle(th);
+    }
+
+    spdlog::info("[SWZC diag1] enabled; side log at {}", utility::narrow(path));
+}
+
+void framework::swzc_diag_exec_begin(const void* engine, std::wstring_view command, const char* site) {
+    using namespace swzc_diag;
+
+    if (!swzc_diag_enabled()) {
+        return;
+    }
+
+    refresh_modules();
+
+    const auto no = g_exec_count.fetch_add(1) + 1;
+    {
+        auto l = begin_line();
+        l.s("[EXEC-BEGIN] #").dec(no).s(" site ").s(site).s(" cmd \"").w(command).s("\" engine ")
+            .hex((uintptr_t)engine).s(" depth_before ").dec((uint64_t)(std::max)(0, (int)g_exec_depth.load()));
+        write(l);
+    }
+
+    if (no == 1) {
+        dump_engine_object(engine);
+
+        // Head: registered now, after FFakeStereoRenderingHook's null-deref
+        // patcher (First=1 at hook time), so it sees every exception first.
+        // Tail: appended after the existing first-chance logger.
+        AddVectoredExceptionHandler(1, &veh_head);
+        AddVectoredExceptionHandler(0, &veh_tail);
+        g_veh_active.store(true, std::memory_order_release);
+
+        auto l = begin_line();
+        l.s("[DIAG1] head/tail VEHs registered; main log now flushes every line");
+        write(l);
+
+        // Keep the main log's last info lines on disk too: the 00053 log could
+        // only show lines up to the last error-level flush.
+        spdlog::flush_on(spdlog::level::info);
+    }
+
+    if (const auto logger = spdlog::default_logger()) {
+        logger->flush();
+    }
+
+    g_exec_tid.store(GetCurrentThreadId(), std::memory_order_release);
+    g_exec_depth.fetch_add(1);
+    g_exec_begin_us.store(now_us(), std::memory_order_release);
+}
+
+void framework::swzc_diag_exec_end(const char* site) {
+    using namespace swzc_diag;
+
+    if (!swzc_diag_enabled()) {
+        return;
+    }
+
+    g_exec_depth.fetch_sub(1);
+    auto l = begin_line();
+    l.s("[EXEC-END] site ").s(site).s(" took_ms ").dec((now_us() - g_exec_begin_us.load()) / 1000);
+    write(l);
+}
+
+void framework::swzc_diag_note_unhandled(struct _EXCEPTION_POINTERS* ei) {
+    using namespace swzc_diag;
+
+    if (!swzc_diag_enabled() || ei == nullptr) {
+        return;
+    }
+
+    auto l = begin_line();
+    l.s("[UNHANDLED] code ").hex(ei->ExceptionRecord->ExceptionCode).s(" RIP ");
+    describe(l, (uintptr_t)ei->ContextRecord->Rip);
+    write(l);
 }

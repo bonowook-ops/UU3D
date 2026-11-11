@@ -43,6 +43,7 @@
 #include <sdk/UClass.hpp>
 
 #include "Framework.hpp"
+#include "ExceptionHandler.hpp" // diag1: SWZeroCompany-only exec markers
 #include "PluginLoader.hpp"
 
 #include "vr/GameDepthCapture.hpp"
@@ -2500,7 +2501,7 @@ void VR::update_flat3d_params() {
                             if (auto* engine = sdk::UEngine::get(); engine != nullptr) {
                                 const std::wstring cmd = L"r.SetRes " + std::to_wstring(rebake_w) +
                                                          L"x" + std::to_wstring(rebake_h) + L"w";
-                                engine->exec(cmd.c_str());
+                                framework::swzc_diag_exec(engine, cmd, "flat3d-rebake-half");
                             }
                         });
                         spdlog::info("[Flat3D] Native Render + Upscale: booted at {}x{} — re-baking "
@@ -2711,7 +2712,7 @@ void VR::update_flat3d_params() {
 
                                 const std::wstring cmd =
                                     L"r.SetRes " + std::to_wstring(swap_w) + L"x" + std::to_wstring(swap_h);
-                                engine->exec(cmd.c_str());
+                                framework::swzc_diag_exec(engine, cmd, "flat3d-native-setres");
                             }
                         });
                     } else if (nudge_attempts == 6) {
@@ -2800,7 +2801,7 @@ void VR::update_flat3d_params() {
                                 if (auto* engine = sdk::UEngine::get(); engine != nullptr) {
                                     const std::wstring cmd =
                                         L"r.SetRes " + std::to_wstring(logical_w) + L"x" + std::to_wstring(logical_h);
-                                    engine->exec(cmd.c_str());
+                                    framework::swzc_diag_exec(engine, cmd, "flat3d-dpi-echo-setres");
                                 }
                             });
                         }
@@ -2950,7 +2951,7 @@ void VR::update_flat3d_params() {
 
                 GameThreadWorker::get().enqueue([]() {
                     if (auto* engine = sdk::UEngine::get(); engine != nullptr) {
-                        engine->exec(L"r.HDR.EnableHDROutput 0");
+                        framework::swzc_diag_exec(engine, L"r.HDR.EnableHDROutput 0", "flat3d-force-sdr");
                     }
                 });
             }
