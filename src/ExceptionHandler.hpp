@@ -20,16 +20,32 @@ bool is_module_detaching();
 // capped internally, so it is safe to call from a polling loop.
 void dump_all_thread_stacks(const char* reason);
 
-// --- SW Zero Company diagnostic build (diag1) --------------------------------
+// --- SW Zero Company diagnostic build (diag1/diag2) --------------------------------
 // Observation only, enabled only when the host executable is SWZeroCompany.exe;
 // every function below returns immediately for any other game. Writes a raw
-// side log (swzc_diag1.txt in the persistent dir) without spdlog, so it keeps
+// side log (swzc_diag2.txt in the persistent dir) without spdlog, so it keeps
 // working if the spdlog lock or the loader lock is what is stuck.
 void swzc_diag_init();
 bool swzc_diag_enabled();
 void swzc_diag_exec_begin(const void* engine, std::wstring_view command, const char* site);
 void swzc_diag_exec_end(const char* site);
 void swzc_diag_note_unhandled(struct _EXCEPTION_POINTERS* ei);
+
+// diag2: what the SWZC CopyTextureRegionChecked mid-hook saw for one copy and
+// which branch it took. Purely a record; the hook's decisions are unchanged.
+// Zero means "not known at this branch".
+struct SwzcCopyNote {
+    const char* verdict;
+    unsigned long long box_left, box_top, box_right, box_bottom, box_front, box_back;
+    unsigned long long packed_w, packed_h;
+    unsigned long long trusted_w, trusted_h;
+    unsigned long long src_w, src_h, dst_w, dst_h;
+    unsigned long long src_fmt, dst_fmt, src_flags, dst_flags;
+    unsigned long long src_depth, dst_depth, src_mips, dst_mips, src_layout, dst_layout, src_samples, dst_samples;
+    unsigned long long src_res, dst_res;
+    int hmd_active;
+};
+void swzc_diag_note_copy(const SwzcCopyNote& note);
 
 // Wraps engine->exec(command) with diag markers. Identical behavior: the
 // command runs exactly once and nothing is caught here (a try/catch would

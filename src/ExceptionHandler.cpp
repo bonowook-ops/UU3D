@@ -536,7 +536,7 @@ void framework::dump_all_thread_stacks(const char* reason) {
     }
 }
 
-// --- SW Zero Company diagnostic build (diag1) --------------------------------
+// --- SW Zero Company diagnostic build (diag1/diag2) --------------------------------
 // Purpose: find out what kills SWZeroCompany.exe right after Flat3D's native
 // resize nudge runs engine->exec("r.SetRes ...") for the first time (the
 // UEngine::Exec discovery scan). Observation only: nothing here changes what
@@ -564,6 +564,12 @@ std::atomic<uint64_t> g_tail_n{0};
 std::atomic<uint64_t> g_head_k32{0};
 std::atomic<uint64_t> g_tail_k32{0};
 std::atomic<uint32_t> g_veh_lines{0};
+std::atomic<uint32_t> g_ods_lines{0};
+std::atomic<uint64_t> g_ods_count{0};
+std::atomic<uint32_t> g_copy_lines{0};
+std::atomic<uint64_t> g_copy_total{0};
+std::atomic<uint64_t> g_copy_args{0}, g_copy_hmd{0}, g_copy_box{0}, g_copy_desc{0}, g_copy_reject{0}, g_copy_clamped{0},
+    g_copy_other{0};
 
 uintptr_t g_k32_base{0}, g_k32_end{0};
 uintptr_t g_kb_base{0}, g_kb_end{0};
@@ -831,6 +837,15 @@ void dump_all_threads(const char* reason) {
     write(l);
 }
 
+void write_copy_counters(const char* tag) {
+    auto l = begin_line();
+    l.s(tag).s(" copyhook total=").dec(g_copy_total.load()).s(" skip_args=").dec(g_copy_args.load())
+        .s(" skip_hmd_inactive=").dec(g_copy_hmd.load()).s(" skip_box_not_full_packed=").dec(g_copy_box.load())
+        .s(" skip_desc_unreadable=").dec(g_copy_desc.load()).s(" reject_conditions=").dec(g_copy_reject.load())
+        .s(" clamped=").dec(g_copy_clamped.load()).s(" other=").dec(g_copy_other.load());
+    write(l);
+}
+
 DWORD WINAPI watchdog_thread(void*) {
     uint64_t tick = 0;
     bool dumped_1s = false;
@@ -848,8 +863,10 @@ DWORD WINAPI watchdog_thread(void*) {
         if (!active) {
             if (tick % 4 == 0) {
                 auto l = begin_line();
-                l.s("[HB] idle execs=").dec(g_exec_count.load());
+                l.s("[HB] idle execs=").dec(g_exec_count.load()).s(" veh_head=").dec(g_head_n.load())
+                    .s(" ods=").dec(g_ods_count.load());
                 write(l);
+                write_copy_counters("[HB]");
             }
             if (tick % 8 == 0) {
                 refresh_modules();
@@ -874,6 +891,7 @@ DWORD WINAPI watchdog_thread(void*) {
                 .s(" k32_head=").dec(g_head_k32.load()).s(" k32_tail=").dec(g_tail_k32.load());
             write(l);
         }
+        write_copy_counters("[HB]");
 
         if (const auto tid = g_exec_tid.load(); tid != 0 && tid != GetCurrentThreadId()) {
             sample_thread(tid, "[GAMETHREAD]", 24);
@@ -890,16 +908,90 @@ DWORD WINAPI watchdog_thread(void*) {
     }
 }
 
+void write_ods(bool wide, size_t length, uintptr_t ptr) {
+    auto l = begin_line();
+    l.s(wide ? "[ODS-W] " : "[ODS-A] ");
+    constexpr size_t max_chars = 900;
+    const size_t n = (std::min)(length, max_chars);
+
+    if (wide) {
+        wchar_t buf[max_chars];
+        if (n > 0 && read_mem(ptr, buf, n * sizeof(wchar_t))) {
+            for (size_t i = 0; i < n && buf[i] != L'\0' && l.n < sizeof(l.buf) - 2; ++i) {
+                const auto c = buf[i];
+                l.buf[l.n++] = (c == L'\n' || c == L'\r') ? ' ' : ((c >= 32 && c < 127) ? (char)c : '?');
+            }
+        } else {
+            l.s("<unreadable>");
+        }
+    } else {
+        char buf[max_chars];
+        if (n > 0 && read_mem(ptr, buf, n)) {
+            for (size_t i = 0; i < n && buf[i] != '\0' && l.n < sizeof(l.buf) - 2; ++i) {
+                const auto c = buf[i];
+                l.buf[l.n++] = (c == '\n' || c == '\r') ? ' ' : ((c >= 32 && c < 127) ? c : '?');
+            }
+        } else {
+            l.s("<unreadable>");
+        }
+    }
+
+    write(l);
+}
+
+// Lock-free, fixed-size (key -> count) table for the VEHs. Keys that do not
+// fit once the table is full are reported with count 1 every time.
+constexpr size_t repeat_slots = 256;
+std::atomic<uint64_t> g_repeat_keys[repeat_slots]{};
+std::atomic<uint32_t> g_repeat_counts[repeat_slots]{};
+
+uint32_t count_repeat(uint64_t key) {
+    if (key == 0) {
+        key = 1;
+    }
+    const size_t start = (size_t)((key * 11400714819323198485ull) >> 56);
+    for (size_t i = 0; i < repeat_slots; ++i) {
+        const size_t slot = (start + i) % repeat_slots;
+        auto current = g_repeat_keys[slot].load(std::memory_order_acquire);
+        if (current == 0) {
+            uint64_t expected = 0;
+            if (g_repeat_keys[slot].compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
+                current = key;
+            } else {
+                current = expected;
+            }
+        }
+        if (current == key) {
+            return g_repeat_counts[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
+        }
+    }
+    return 1;
+}
+
 LONG veh_common(PEXCEPTION_POINTERS ei, bool head) {
     if (framework::is_module_detaching() || !g_veh_active.load(std::memory_order_acquire)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
     const auto code = ei->ExceptionRecord->ExceptionCode;
-    const bool interesting = (code & 0xF0000000u) == 0xC0000000u || code == 1 || code == EXCEPTION_BREAKPOINT ||
-                             code == 0xE06D7363u /* C++ throw */;
 
-    if (!interesting) {
+    // diag2: OutputDebugString arrives as these two exceptions even without a
+    // debugger; with UE's -d3ddebug this is where the D3D12 debug layer's
+    // validation messages appear. Head only, so each message is written once.
+    if (code == 0x40010006u /* DBG_PRINTEXCEPTION_C */ || code == 0x4001000Au /* DBG_PRINTEXCEPTION_WIDE_C */) {
+        if (head) {
+            ++g_ods_count;
+            if (ei->ExceptionRecord->NumberParameters >= 2 && g_ods_lines.fetch_add(1) < 6000) {
+                write_ods(code == 0x4001000Au, (size_t)ei->ExceptionRecord->ExceptionInformation[0],
+                          (uintptr_t)ei->ExceptionRecord->ExceptionInformation[1]);
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // diag2: every other code except thread naming (UE names each thread this
+    // way), so the code UE raises for its fatal error is recorded too.
+    if (code == 0x406D1388u /* MS-VC SetThreadName */) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
@@ -918,9 +1010,19 @@ LONG veh_common(PEXCEPTION_POINTERS ei, bool head) {
 
     const auto n = ++(head ? g_head_n : g_tail_n);
 
-    if (g_veh_lines.fetch_add(1) < 6000) {
+    // Per-(RIP,code,side) repeat count, so a probe that faults by design (the
+    // kananlib readable-window probe faults ~1000 times at startup) cannot use
+    // up the line budget before the fatal error: log the first 3 of each, then
+    // every 1000th.
+    const auto repeat = count_repeat((uint64_t)rip ^ ((uint64_t)code << 32) ^ (head ? 0x1ull : 0x2ull));
+
+    if (repeat > 3 && repeat % 1000 != 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (g_veh_lines.fetch_add(1) < 8000) {
         auto l = begin_line();
-        l.s(tag).s(" #").dec(n).s(" code ").hex(code).s(" RIP ");
+        l.s(tag).s(" #").dec(n).s(" code ").hex(code).s(" repeat ").dec(repeat).s(" RIP ");
         describe(l, rip);
         if (code == EXCEPTION_ACCESS_VIOLATION && ei->ExceptionRecord->NumberParameters >= 2) {
             l.s(" av_kind ").dec(ei->ExceptionRecord->ExceptionInformation[0]).s(" addr ")
@@ -1002,7 +1104,7 @@ void install_hook(safetyhook::InlineHook& hook, const wchar_t* module, const cha
     const auto mod = GetModuleHandleW(module);
     const auto fn = mod != nullptr ? (void*)GetProcAddress(mod, export_name) : nullptr;
     auto l = begin_line();
-    l.s("[DIAG1] hook ").s(export_name).s(" at ");
+    l.s("[DIAG2] hook ").s(export_name).s(" at ");
     if (fn == nullptr) {
         l.s("<not found>");
         write(l);
@@ -1012,7 +1114,7 @@ void install_hook(safetyhook::InlineHook& hook, const wchar_t* module, const cha
     {
         // Written before installing, so a failure during installation is visible.
         auto pre = begin_line();
-        pre.s("[DIAG1] installing hook ").s(export_name);
+        pre.s("[DIAG2] installing hook ").s(export_name);
         write(pre);
     }
     hook = safetyhook::create_inline(fn, detour);
@@ -1085,13 +1187,13 @@ void framework::swzc_diag_init() {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc0);
 
-    const auto path = (Framework::get_persistent_dir() / "swzc_diag1.txt").wstring();
+    const auto path = (Framework::get_persistent_dir() / "swzc_diag2.txt").wstring();
     DeleteFileW(path.c_str());
     g_file = CreateFileW(path.c_str(), FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
     if (g_file == INVALID_HANDLE_VALUE) {
-        spdlog::error("[SWZC diag1] could not open side log ({})", GetLastError());
+        spdlog::error("[SWZC diag2] could not open side log ({})", GetLastError());
         return;
     }
 
@@ -1101,12 +1203,20 @@ void framework::swzc_diag_init() {
 
     {
         auto l = begin_line();
-        l.s("[DIAG1] uu3d-swzc-diag1 side log, pid ").dec(GetCurrentProcessId())
+        l.s("[DIAG2] uu3d-swzc-diag2 side log, pid ").dec(GetCurrentProcessId())
             .s(". Times are seconds since this line.");
         write(l);
     }
 
     g_enabled.store(true, std::memory_order_release);
+
+    // diag2: head/tail VEHs from the start (the fatal error is on the RHI thread
+    // and need not follow an exec). FFakeStereoRenderingHook's null-deref
+    // patcher, registered later with First=1, will sit in front of the head;
+    // it only acts on access violations.
+    AddVectoredExceptionHandler(1, &veh_head);
+    AddVectoredExceptionHandler(0, &veh_tail);
+    g_veh_active.store(true, std::memory_order_release);
 
     // NtTerminateProcess is deliberately NOT hooked: it is an ntdll syscall stub
     // and installing an inline hook there kills the process (verified in a
@@ -1120,7 +1230,7 @@ void framework::swzc_diag_init() {
         CloseHandle(th);
     }
 
-    spdlog::info("[SWZC diag1] enabled; side log at {}", utility::narrow(path));
+    spdlog::info("[SWZC diag2] enabled; side log at {}", utility::narrow(path));
 }
 
 void framework::swzc_diag_exec_begin(const void* engine, std::wstring_view command, const char* site) {
@@ -1143,15 +1253,8 @@ void framework::swzc_diag_exec_begin(const void* engine, std::wstring_view comma
     if (no == 1) {
         dump_engine_object(engine);
 
-        // Head: registered now, after FFakeStereoRenderingHook's null-deref
-        // patcher (First=1 at hook time), so it sees every exception first.
-        // Tail: appended after the existing first-chance logger.
-        AddVectoredExceptionHandler(1, &veh_head);
-        AddVectoredExceptionHandler(0, &veh_tail);
-        g_veh_active.store(true, std::memory_order_release);
-
         auto l = begin_line();
-        l.s("[DIAG1] head/tail VEHs registered; main log now flushes every line");
+        l.s("[DIAG2] main log now flushes every line");
         write(l);
 
         // Keep the main log's last info lines on disk too: the 00053 log could
@@ -1191,5 +1294,56 @@ void framework::swzc_diag_note_unhandled(struct _EXCEPTION_POINTERS* ei) {
     auto l = begin_line();
     l.s("[UNHANDLED] code ").hex(ei->ExceptionRecord->ExceptionCode).s(" RIP ");
     describe(l, (uintptr_t)ei->ContextRecord->Rip);
+    write(l);
+}
+
+void framework::swzc_diag_note_copy(const SwzcCopyNote& n) {
+    using namespace swzc_diag;
+
+    if (!swzc_diag_enabled() || n.verdict == nullptr) {
+        return;
+    }
+
+    const auto total = ++g_copy_total;
+    const std::string_view v{n.verdict};
+
+    if (v == "skip:args") {
+        ++g_copy_args;
+    } else if (v == "skip:hmd_inactive") {
+        ++g_copy_hmd;
+    } else if (v == "skip:box_not_full_packed") {
+        ++g_copy_box;
+    } else if (v == "skip:desc_unreadable") {
+        ++g_copy_desc;
+    } else if (v == "reject:conditions") {
+        ++g_copy_reject;
+    } else if (v == "clamped") {
+        ++g_copy_clamped;
+    } else {
+        ++g_copy_other;
+    }
+
+    // The first 40 copies in full, then only the ones that matter: a box wider
+    // than any desktop (the packed-HMD present copy is twice the eye width) or
+    // a verdict past the cheap gates.
+    const bool interesting = n.box_right > 4096 || n.src_w > 4096 || v == "reject:conditions" || v == "clamped" ||
+                             v == "skip:desc_unreadable";
+
+    if (!(total <= 40 || interesting) || g_copy_lines.fetch_add(1) >= 1500) {
+        return;
+    }
+
+    auto l = begin_line();
+    l.s("[COPY] #").dec(total).s(" ").s(n.verdict).s(" hmd_active=")
+        .dec((uint64_t)(n.hmd_active < 0 ? 9 : n.hmd_active))
+        .s(" box=[").dec(n.box_left).s(",").dec(n.box_top).s(",").dec(n.box_front).s(" -> ").dec(n.box_right).s(",")
+        .dec(n.box_bottom).s(",").dec(n.box_back).s("] packed=").dec(n.packed_w).s("x").dec(n.packed_h)
+        .s(" trusted_desktop=").dec(n.trusted_w).s("x").dec(n.trusted_h)
+        .s(" src=").hex(n.src_res).s(" ").dec(n.src_w).s("x").dec(n.src_h).s(" fmt ").dec(n.src_fmt).s(" flags ")
+        .hex(n.src_flags).s(" arr ").dec(n.src_depth).s(" mips ").dec(n.src_mips).s(" layout ").dec(n.src_layout)
+        .s(" ms ").dec(n.src_samples)
+        .s(" dst=").hex(n.dst_res).s(" ").dec(n.dst_w).s("x").dec(n.dst_h).s(" fmt ").dec(n.dst_fmt).s(" flags ")
+        .hex(n.dst_flags).s(" arr ").dec(n.dst_depth).s(" mips ").dec(n.dst_mips).s(" layout ").dec(n.dst_layout)
+        .s(" ms ").dec(n.dst_samples);
     write(l);
 }

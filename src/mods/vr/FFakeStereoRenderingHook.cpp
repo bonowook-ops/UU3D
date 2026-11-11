@@ -2961,6 +2961,64 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
         *reinterpret_cast<const D3D12_BOX* const*>(ctx.rsp + src_box_stack_offset);
     const auto dst_z = *reinterpret_cast<const uint32_t*>(ctx.rsp + dst_z_stack_offset);
 
+    // diag2 (SWZeroCompany only, observation only): record what this hook saw
+    // and which branch it took. It never changes a decision below.
+    const auto diag_note = [&](const char* verdict, uint64_t packed_w, uint64_t packed_h,
+                               const D3D12_RESOURCE_DESC* src_d, const D3D12_RESOURCE_DESC* dst_d,
+                               uint64_t trusted_w, uint64_t trusted_h, int hmd_active) {
+        if (!framework::swzc_diag_enabled()) {
+            return;
+        }
+        framework::SwzcCopyNote n{};
+        n.verdict = verdict;
+        if (src_box != nullptr &&
+            is_readable_process_range(reinterpret_cast<uintptr_t>(src_box), sizeof(*src_box)))
+        {
+            n.box_left = src_box->left;
+            n.box_top = src_box->top;
+            n.box_right = src_box->right;
+            n.box_bottom = src_box->bottom;
+            n.box_front = src_box->front;
+            n.box_back = src_box->back;
+        }
+        n.packed_w = packed_w;
+        n.packed_h = packed_h;
+        n.trusted_w = trusted_w;
+        n.trusted_h = trusted_h;
+        if (src_d != nullptr) {
+            n.src_w = src_d->Width;
+            n.src_h = src_d->Height;
+            n.src_fmt = (uint64_t)src_d->Format;
+            n.src_flags = (uint64_t)src_d->Flags;
+            n.src_depth = src_d->DepthOrArraySize;
+            n.src_mips = src_d->MipLevels;
+            n.src_layout = (uint64_t)src_d->Layout;
+            n.src_samples = src_d->SampleDesc.Count;
+        }
+        if (dst_d != nullptr) {
+            n.dst_w = dst_d->Width;
+            n.dst_h = dst_d->Height;
+            n.dst_fmt = (uint64_t)dst_d->Format;
+            n.dst_flags = (uint64_t)dst_d->Flags;
+            n.dst_depth = dst_d->DepthOrArraySize;
+            n.dst_mips = dst_d->MipLevels;
+            n.dst_layout = (uint64_t)dst_d->Layout;
+            n.dst_samples = dst_d->SampleDesc.Count;
+        }
+        if (src_location != nullptr &&
+            is_readable_process_range(reinterpret_cast<uintptr_t>(src_location), sizeof(*src_location)))
+        {
+            n.src_res = reinterpret_cast<uintptr_t>(src_location->pResource);
+        }
+        if (dst_location != nullptr &&
+            is_readable_process_range(reinterpret_cast<uintptr_t>(dst_location), sizeof(*dst_location)))
+        {
+            n.dst_res = reinterpret_cast<uintptr_t>(dst_location->pResource);
+        }
+        n.hmd_active = hmd_active;
+        framework::swzc_diag_note_copy(n);
+    };
+
     if (dst_location == nullptr || src_location == nullptr || src_box == nullptr ||
         !is_readable_process_range(reinterpret_cast<uintptr_t>(dst_location), sizeof(*dst_location)) ||
         !is_readable_process_range(reinterpret_cast<uintptr_t>(src_location), sizeof(*src_location)) ||
@@ -2976,11 +3034,13 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
         src_location->pResource == nullptr ||
         dst_location->pResource == src_location->pResource)
     {
+        diag_note("skip:args", 0, 0, nullptr, nullptr, 0, 0, -1);
         return;
     }
 
     const auto vr = VR::get();
     if (vr == nullptr || !vr->is_hmd_active()) {
+        diag_note("skip:hmd_inactive", 0, 0, nullptr, nullptr, 0, 0, 0);
         return;
     }
 
@@ -2996,6 +3056,7 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
         src_box->bottom != packed_height ||
         src_box->back != 1)
     {
+        diag_note("skip:box_not_full_packed", packed_width, packed_height, nullptr, nullptr, 0, 0, 1);
         return;
     }
 
@@ -3004,6 +3065,7 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     if (!get_d3d12_resource_desc_guarded(dst_location->pResource, dst_desc) ||
         !get_d3d12_resource_desc_guarded(src_location->pResource, src_desc))
     {
+        diag_note("skip:desc_unreadable", packed_width, packed_height, nullptr, nullptr, 0, 0, 1);
         return;
     }
 
@@ -3037,6 +3099,8 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
         dst_desc.Flags == D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
     if (!exact_invalid_present_copy) {
+        diag_note("reject:conditions", packed_width, packed_height, &src_desc, &dst_desc,
+                  trusted_desktop_width, trusted_desktop_height, 1);
         return;
     }
 
@@ -3047,6 +3111,8 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     clamped_box.right = desktop_width;
     clamped_box.bottom = desktop_height;
     *reinterpret_cast<const D3D12_BOX**>(ctx.rsp + src_box_stack_offset) = &clamped_box;
+    diag_note("clamped", packed_width, packed_height, &src_desc, &dst_desc,
+              trusted_desktop_width, trusted_desktop_height, 1);
 
     SPDLOG_INFO_ONCE(
         "[SWZeroCompany][UE5.6][DX12Copy] Clamped the validated packed-HMD to desktop copy from {}x{} to {}x{}",
