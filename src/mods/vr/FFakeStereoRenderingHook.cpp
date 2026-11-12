@@ -71,6 +71,7 @@
 #include <sdk/UObjectArray.hpp>
 #include <sdk/FBoolProperty.hpp>
 #include <sdk/FField.hpp>
+#include <sdk/FFieldClass.hpp>
 #include <sdk/FViewport.hpp>
 #include <sdk/UKismetRenderingLibrary.hpp>
 #include <sdk/UTexture.hpp>
@@ -2663,6 +2664,269 @@ bool sw_zero_company_ue56_is_current_game() {
 
     return result;
 }
+
+// SWZC diag4 (logging only): Star Wars Zero Company shows a right-eye-only
+// glow while depth of field is enabled. Record the final post-process
+// settings UE hands the stereo device for each view so the left and right
+// eye values can be compared. The engine defaults in these slots are empty
+// functions, and the hooks call them unchanged, so rendering is unaffected.
+namespace swzc_diag4 {
+using StereoPostprocessFn = void(__fastcall*)(void* device, void* settings, uintptr_t a3, uintptr_t a4);
+
+std::atomic<StereoPostprocessFn> g_original_start{};
+std::atomic<StereoPostprocessFn> g_original_end{};
+std::atomic_uint64_t g_start_calls{};
+std::atomic_uint64_t g_end_calls{};
+
+enum class Kind : uint8_t { missing, f32, f64, i32, u8, boolean, other };
+
+struct Field {
+    const wchar_t* name;
+    Kind kind{Kind::missing};
+    int32_t offset{-1};
+    const sdk::FBoolProperty* bool_prop{};
+};
+
+std::array<Field, 31> g_fields{{
+    {L"bOverride_DepthOfFieldFocalDistance"},
+    {L"bOverride_DepthOfFieldFstop"},
+    {L"bOverride_DepthOfFieldDepthBlurAmount"},
+    {L"bOverride_DepthOfFieldDepthBlurRadius"},
+    {L"DepthOfFieldFocalDistance"},
+    {L"DepthOfFieldFstop"},
+    {L"DepthOfFieldMinFstop"},
+    {L"DepthOfFieldBladeCount"},
+    {L"DepthOfFieldSensorWidth"},
+    {L"DepthOfFieldSqueezeFactor"},
+    {L"DepthOfFieldDepthBlurAmount"},
+    {L"DepthOfFieldDepthBlurRadius"},
+    {L"DepthOfFieldFocalRegion"},
+    {L"DepthOfFieldNearTransitionRegion"},
+    {L"DepthOfFieldFarTransitionRegion"},
+    {L"DepthOfFieldScale"},
+    {L"DepthOfFieldNearBlurSize"},
+    {L"DepthOfFieldFarBlurSize"},
+    {L"DepthOfFieldOcclusion"},
+    {L"DepthOfFieldSkyFocusDistance"},
+    {L"DepthOfFieldVignetteSize"},
+    {L"DepthOfFieldUseHairDepth"},
+    {L"DepthOfFieldPhysicalCameraBlend"},
+    {L"DepthOfFieldForegroundBlur"},
+    {L"DepthOfFieldBackgroundBlur"},
+    {L"AutoExposureMethod"},
+    {L"AutoExposureBias"},
+    {L"AutoExposureMinBrightness"},
+    {L"AutoExposureMaxBrightness"},
+    {L"BloomIntensity"},
+    {L"LensFlareIntensity"},
+}};
+
+constexpr size_t k_snapshot_bytes = 0x4000;
+std::once_flag g_resolve_once{};
+bool g_resolved{};
+size_t g_snapshot_size{};
+std::mutex g_log_mutex{};
+std::array<std::string, 5> g_last_values{};
+uint32_t g_lines{};
+constexpr uint32_t k_max_lines = 4000;
+
+bool safe_copy(void* dst, const void* src, size_t size) {
+    __try {
+        std::memcpy(dst, src, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void resolve_fields() {
+    auto* const settings_struct =
+        sdk::find_uobject<sdk::UScriptStruct>(L"ScriptStruct /Script/Engine.PostProcessSettings");
+    if (settings_struct == nullptr) {
+        SPDLOG_WARN("[SWZC diag4] ScriptStruct /Script/Engine.PostProcessSettings was not found; post-process logging is off");
+        return;
+    }
+
+    std::string layout{};
+    for (auto& field : g_fields) {
+        const auto* const prop = settings_struct->find_property(field.name);
+        if (prop == nullptr) {
+            layout += fmt::format(" {}=missing", utility::narrow(field.name));
+            continue;
+        }
+
+        const auto* const field_class = ((const sdk::FField*)prop)->get_class();
+        const auto class_name = field_class != nullptr ? field_class->get_name().to_string() : std::wstring{};
+        field.offset = prop->get_offset();
+
+        if (class_name == L"FloatProperty") {
+            field.kind = Kind::f32;
+        } else if (class_name == L"DoubleProperty") {
+            field.kind = Kind::f64;
+        } else if (class_name == L"IntProperty") {
+            field.kind = Kind::i32;
+        } else if (class_name == L"ByteProperty" || class_name == L"EnumProperty") {
+            field.kind = Kind::u8;
+        } else if (class_name == L"BoolProperty") {
+            field.kind = Kind::boolean;
+            field.bool_prop = (const sdk::FBoolProperty*)prop;
+        } else {
+            field.kind = Kind::other;
+        }
+
+        if (field.offset < 0 || static_cast<size_t>(field.offset) + 8 > k_snapshot_bytes) {
+            field.kind = Kind::missing;
+        } else {
+            g_snapshot_size = (std::max)(g_snapshot_size, static_cast<size_t>(field.offset) + 8);
+        }
+
+        layout += fmt::format(" {}@{:x}:{}", utility::narrow(field.name), field.offset, utility::narrow(class_name));
+    }
+
+    g_resolved = g_snapshot_size > 0;
+    SPDLOG_INFO("[SWZC diag4] PostProcessSettings layout (snapshot {} bytes):{}", g_snapshot_size, layout);
+}
+
+std::string describe(const uint8_t* snapshot) {
+    std::string out{};
+    for (const auto& field : g_fields) {
+        const auto* const at = snapshot + (field.offset < 0 ? 0 : field.offset);
+        switch (field.kind) {
+        case Kind::f32: {
+            float v{};
+            std::memcpy(&v, at, sizeof(v));
+            out += fmt::format(" {}={:.5g}", utility::narrow(field.name), v);
+            break;
+        }
+        case Kind::f64: {
+            double v{};
+            std::memcpy(&v, at, sizeof(v));
+            out += fmt::format(" {}={:.5g}", utility::narrow(field.name), v);
+            break;
+        }
+        case Kind::i32: {
+            int32_t v{};
+            std::memcpy(&v, at, sizeof(v));
+            out += fmt::format(" {}={}", utility::narrow(field.name), v);
+            break;
+        }
+        case Kind::u8:
+            out += fmt::format(" {}={}", utility::narrow(field.name), static_cast<uint32_t>(*at));
+            break;
+        case Kind::boolean:
+            out += fmt::format(" {}={}", utility::narrow(field.name),
+                field.bool_prop->get_value_from_propbase(const_cast<uint8_t*>(at)) ? 1 : 0);
+            break;
+        default:
+            break;
+        }
+    }
+    return out;
+}
+
+void note_end(void* settings, uintptr_t a3, uintptr_t a4) {
+    const auto call = g_end_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::call_once(g_resolve_once, resolve_fields);
+
+    const auto view = static_cast<int32_t>(static_cast<uint32_t>(a3));
+    const auto slot = view >= 0 && view < 4 ? static_cast<size_t>(view) : size_t{4};
+
+    std::string values{};
+    if (!g_resolved || settings == nullptr) {
+        values = " <unresolved>";
+    } else {
+        std::array<uint8_t, k_snapshot_bytes> snapshot{};
+        if (!safe_copy(snapshot.data(), settings, g_snapshot_size)) {
+            values = " <unreadable>";
+        } else {
+            values = describe(snapshot.data());
+        }
+    }
+
+    std::scoped_lock _{g_log_mutex};
+    if (g_lines >= k_max_lines) {
+        return;
+    }
+
+    const bool changed = values != g_last_values[slot];
+    if (changed || call <= 8 || call % 2000 == 0) {
+        ++g_lines;
+        SPDLOG_INFO("[SWZC diag4] PP end call={} start_calls={} view={} a3={:x} a4={:x} settings={:x}{}{}",
+            call,
+            g_start_calls.load(std::memory_order_relaxed),
+            view,
+            a3,
+            a4,
+            reinterpret_cast<uintptr_t>(settings),
+            changed ? " CHANGED" : "",
+            values);
+        g_last_values[slot] = std::move(values);
+    }
+}
+
+void __fastcall start_hook(void* device, void* settings, uintptr_t a3, uintptr_t a4) {
+    g_start_calls.fetch_add(1, std::memory_order_relaxed);
+    if (const auto original = g_original_start.load(std::memory_order_acquire); original != nullptr) {
+        original(device, settings, a3, a4);
+    }
+}
+
+void __fastcall end_hook(void* device, void* settings, uintptr_t a3, uintptr_t a4) {
+    note_end(settings, a3, a4);
+    if (const auto original = g_original_end.load(std::memory_order_acquire); original != nullptr) {
+        original(device, settings, a3, a4);
+    }
+}
+
+bool slot_is_empty_return(uintptr_t fn) {
+    std::array<uint8_t, 3> bytes{};
+    SIZE_T bytes_read{};
+    if (fn == 0 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(fn), bytes.data(), bytes.size(), &bytes_read) ||
+        bytes_read != bytes.size()) {
+        return false;
+    }
+    // ret, or ret 0
+    return bytes[0] == 0xC3 || (bytes[0] == 0xC2 && bytes[1] == 0x00 && bytes[2] == 0x00);
+}
+
+bool slot_is_return_false(uintptr_t fn) {
+    std::array<uint8_t, 3> bytes{};
+    SIZE_T bytes_read{};
+    if (fn == 0 || !ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(fn), bytes.data(), bytes.size(), &bytes_read) ||
+        bytes_read != bytes.size()) {
+        return false;
+    }
+    // xor al, al ; ret
+    return bytes[0] == 0x32 && bytes[1] == 0xC0 && bytes[2] == 0xC3;
+}
+
+bool install(std::vector<uintptr_t>& shadow_vtable) {
+    // UE 5.6 IStereoRendering: 18 StartFinalPostprocessSettings,
+    // 19 OverrideFinalPostprocessSettings, 20 EndFinalPostprocessSettings.
+    constexpr size_t start_slot = 18;
+    constexpr size_t override_slot = 19;
+    constexpr size_t end_slot = 20;
+
+    if (!sw_zero_company_ue56_is_current_game() || shadow_vtable.size() <= end_slot) {
+        return false;
+    }
+
+    if (!slot_is_empty_return(shadow_vtable[start_slot]) || !slot_is_return_false(shadow_vtable[override_slot]) ||
+        !slot_is_empty_return(shadow_vtable[end_slot])) {
+        SPDLOG_WARN("[SWZC diag4] Stereo post-process slots 18/19/20 did not validate ({:x} {:x} {:x}); logging is off",
+            shadow_vtable[start_slot], shadow_vtable[override_slot], shadow_vtable[end_slot]);
+        return false;
+    }
+
+    g_original_start.store(reinterpret_cast<StereoPostprocessFn>(shadow_vtable[start_slot]), std::memory_order_release);
+    g_original_end.store(reinterpret_cast<StereoPostprocessFn>(shadow_vtable[end_slot]), std::memory_order_release);
+    shadow_vtable[start_slot] = reinterpret_cast<uintptr_t>(&start_hook);
+    shadow_vtable[end_slot] = reinterpret_cast<uintptr_t>(&end_hook);
+    SPDLOG_INFO("[SWZC diag4] Logging final post-process settings from stereo vtable slots 18 and 20");
+    return true;
+}
+} // namespace swzc_diag4
+
 
 bool bodycam_ue554_is_current_game() {
     static const bool result = []() {
@@ -18842,6 +19106,7 @@ bool FFakeStereoRenderingHook::standard_fake_stereo_hook(uintptr_t vtable) {
             }
 
             install_dead_island_2_primary_view_override(shadow_vtable);
+            swzc_diag4::install(shadow_vtable);
             vtable = shadow_vtable.data();
         }
     } else {
