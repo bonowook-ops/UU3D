@@ -23750,7 +23750,7 @@ std::mutex g_mutex{};
 uint32_t g_lines{};
 constexpr uint32_t k_max_lines = 4000;
 std::array<std::string, 8> g_last_adjust{};
-std::array<std::string, 16> g_last_view{};
+std::unordered_set<std::string> g_seen_views{};
 std::atomic_uint64_t g_adjust_calls{};
 std::atomic_uint64_t g_view_calls{};
 
@@ -23797,17 +23797,19 @@ void note_scene_view(size_t stage, sdk::FSceneView* view, sdk::FSceneViewInitOpt
     const auto key = fmt::format("rect={},{},{},{} ({}x{}) crect={},{},{},{} ({}x{})",
         rect[0], rect[1], rect[2], rect[3], rect[2] - rect[0], rect[3] - rect[1],
         crect[0], crect[1], crect[2], crect[3], crect[2] - crect[0], crect[3] - crect[1]);
-    const auto slot = (stage & 1) * 8 + (pass < 7 ? static_cast<size_t>(pass) : size_t{7});
+    // diag2: one game frame builds several views per pass (main 3840 view and a
+    // 1024 capture), so log each distinct (stage, pass, rects) combination the
+    // first time it appears instead of flagging every alternation as a change.
+    const auto seen_key = fmt::format("{}|{}|{}", stage, pass, key);
 
     std::scoped_lock _{g_mutex};
-    const bool changed = key != g_last_view[slot];
-    if ((changed || call <= 8 || call % 3000 == 0) && g_lines < k_max_lines) {
+    const bool is_new = g_seen_views.size() < 512 && g_seen_views.insert(seen_key).second;
+    if ((is_new || call <= 8 || call % 3000 == 0) && g_lines < k_max_lines) {
         ++g_lines;
         SPDLOG_INFO("[SND diag1][SceneView] call={} frame={} stage={} pass={} view={:x} layout={} {}{}",
             call, g_frame_count, stage == 0 ? "entry" : "final", pass, reinterpret_cast<uintptr_t>(view),
-            ue50_to_53 ? "ue50-53" : "ue54+", key, changed ? " CHANGED" : "");
+            ue50_to_53 ? "ue50-53" : "ue54+", key, is_new ? " NEW" : "");
     }
-    g_last_view[slot] = key;
 }
 } // namespace snd_diag1
 

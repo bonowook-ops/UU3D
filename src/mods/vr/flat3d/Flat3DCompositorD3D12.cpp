@@ -62,13 +62,13 @@ void barrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* res,
 // loses it. Gated to the one title; nothing that reaches the screen changes.
 namespace snd_probe {
 constexpr uint32_t kSlots = 8;
-constexpr uint32_t kMaxRows = 24;
+constexpr uint32_t kMaxRows = 32;
 constexpr uint64_t kBytes = 4ull << 20;
 constexpr uint64_t kIntervalMs = 5000;
 constexpr uint32_t kMaxProbes = 400;
 
 struct Row {
-    char src[8]{};
+    char src[16]{};
     uint32_t w{}, h{}, y{};
     DXGI_FORMAT fmt{};
     uint32_t bpp{};
@@ -125,6 +125,25 @@ bool lit(const uint8_t* p, DXGI_FORMAT f) {
     }
     default:
         return p[0] > 8 || p[1] > 8 || p[2] > 8;
+    }
+}
+
+// SND diag2: alpha >= 0.5 (raw, before any UI_InvertAlpha). -1 = format has no alpha.
+int alpha_high(const uint8_t* p, DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return p[3] >= 128 ? 1 : 0;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: {
+        uint32_t v{}; std::memcpy(&v, p, 4);
+        return (v >> 30) >= 2 ? 1 : 0;
+    }
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+        uint16_t h{}; std::memcpy(&h, p + 6, 2);
+        return (h & 0x8000) == 0 && ((h >> 10) & 0x1f) >= 14 ? 1 : 0;
+    }
+    default:
+        return -1;
     }
 }
 
@@ -226,25 +245,45 @@ void harvest(Slot& s) {
         const auto* row = (const uint8_t*)data + r.offset;
         constexpr uint32_t kSeg = 16;
         uint32_t seg_lit[kSeg]{};
+        uint32_t seg_alpha[kSeg]{};
         uint32_t lit_total = 0;
+        uint32_t alpha_total = 0;
+        bool has_alpha = true;
         int64_t first = -1, last = -1;
         for (uint32_t x = 0; x < r.w; ++x) {
-            if (lit(row + (uint64_t)x * r.bpp, r.fmt)) {
-                ++seg_lit[(uint64_t)x * kSeg / r.w];
+            const auto* px = row + (uint64_t)x * r.bpp;
+            const auto seg = (uint64_t)x * kSeg / r.w;
+            if (lit(px, r.fmt)) {
+                ++seg_lit[seg];
                 ++lit_total;
                 if (first < 0) { first = x; }
                 last = x;
             }
+            const int a = alpha_high(px, r.fmt);
+            if (a < 0) {
+                has_alpha = false;
+            } else if (a > 0) {
+                ++seg_alpha[seg];
+                ++alpha_total;
+            }
         }
-        // Per-sixteenth fill: '#' >= 90% lit, '0'..'9' tenths, '.' nothing lit.
+        // Per-sixteenth fill: '#' >= 90%, '0'..'9' tenths, '.' none.
+        const auto to_fill = [&](const uint32_t (&counts)[kSeg], char (&out)[kSeg + 1]) {
+            for (uint32_t k = 0; k < kSeg; ++k) {
+                const uint32_t seg_w = (uint32_t)(((uint64_t)(k + 1) * r.w) / kSeg - ((uint64_t)k * r.w) / kSeg);
+                const uint32_t tenth = seg_w > 0 ? counts[k] * 10 / seg_w : 0;
+                out[k] = counts[k] == 0 ? '.' : tenth >= 9 ? '#' : (char)('0' + tenth);
+            }
+            out[kSeg] = '\0';
+        };
         char fill[kSeg + 1]{};
-        for (uint32_t k = 0; k < kSeg; ++k) {
-            const uint32_t seg_w = (uint32_t)(((uint64_t)(k + 1) * r.w) / kSeg - ((uint64_t)k * r.w) / kSeg);
-            const uint32_t tenth = seg_w > 0 ? seg_lit[k] * 10 / seg_w : 0;
-            fill[k] = seg_lit[k] == 0 ? '.' : tenth >= 9 ? '#' : (char)('0' + tenth);
-        }
-        spdlog::info("[SND diag1][probe]   {} {}x{} fmt={} y={}: fill=[{}] lit={}/{} first_x={} last_x={}",
-            r.src, r.w, r.h, (uint32_t)r.fmt, r.y, fill, lit_total, r.w, first, last);
+        char afill[kSeg + 1]{};
+        to_fill(seg_lit, fill);
+        to_fill(seg_alpha, afill);
+        // alpha=[...] marks where alpha >= 0.5 (raw, before UI_InvertAlpha).
+        spdlog::info("[SND diag1][probe]   {} {}x{} fmt={} y={}: fill=[{}] lit={}/{} first_x={} last_x={} alpha=[{}] a_hi={}",
+            r.src, r.w, r.h, (uint32_t)r.fmt, r.y, fill, lit_total, r.w, first, last,
+            has_alpha ? afill : "n/a", alpha_total);
     }
     const D3D12_RANGE no_write{0, 0};
     s.rb->Unmap(0, &no_write);
@@ -873,11 +912,12 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
             ++snd_probe::g_probes;
             const auto header = fmt::format(
                 "#{} frame={} mode={} afr_frame={} afr_left_eye={} synced_pair={} pair_second={} native_stereo_layout={} "
-                "warp_frame={} extreme={} eye={}x{} out={}x{} right_eye_src={} ui_tex={} scene_scale={:.3f} scene_shift_px={:.1f}",
+                "warp_frame={} extreme={} eye={}x{} out={}x{} right_eye_src={} ui_tex={} scene_scale={:.3f} scene_shift_px={:.1f} "
+                "ui_scale={:.3f} ui_crop={:.3f}x{:.3f} ui_invert_alpha={:.2f}",
                 snd_probe::g_probes, m_frame, params.mode, params.afr_frame, params.afr_left_eye, params.afr_synced_pair,
                 params.afr_pair_second, params.native_stereo_layout, params.warp_frame, params.extreme_backbuffer_src,
                 m_eye_w, m_eye_h, out_w, out_h, right_eye_src != nullptr, ui_tex != nullptr, params.scene_scale,
-                params.scene_shift_px);
+                params.scene_shift_px, params.ui_scale, params.ui_crop_x, params.ui_crop_y, params.ui_invert_alpha);
             if (snd_probe::begin(snd_probe::g_slots[slot], m_device, header)) {
                 snd_slot = &snd_probe::g_slots[slot];
             }
@@ -907,6 +947,17 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         // Both sources are in COPY_SOURCE here: what the engine rendered.
         snd_probe::add(cmd, *snd_slot, "dw", double_wide);
         snd_probe::add(cmd, *snd_slot, "second", right_eye_src);
+
+        // SND diag2: the redirected game UI target as the engine left it
+        // (shader-readable, see the post-composite clear) — before any overlay
+        // samples it and before that clear.
+        if (ui_tex != nullptr) {
+            constexpr auto kSndUiState =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier(cmd, ui_tex, kSndUiState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            snd_probe::add(cmd, *snd_slot, "ui", ui_tex);
+            barrier(cmd, ui_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, kSndUiState);
+        }
     }
 
     const auto copy_half = [&](int eye) {
@@ -1057,7 +1108,7 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         // scene each eye will show, before any UI/menu overlay is drawn.
         for (int eye = 0; eye < 2; ++eye) {
             barrier(cmd, m_eye_tex[eye].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            snd_probe::add(cmd, *snd_slot, eye == 0 ? "eye0" : "eye1", m_eye_tex[eye].Get());
+            snd_probe::add(cmd, *snd_slot, eye == 0 ? "eye0_pre" : "eye1_pre", m_eye_tex[eye].Get());
             barrier(cmd, m_eye_tex[eye].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
     }
@@ -1573,6 +1624,16 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
     }
 
     record_overlays(cmd, have_ui, have_menu, params, eye_refresh_mask);
+
+    if (snd_slot != nullptr) {
+        // SND diag2: the same eye caches right after the UI/menu overlays were
+        // drawn into them (still RENDER_TARGET; the loop below moves them to PSR).
+        for (int eye = 0; eye < 2; ++eye) {
+            barrier(cmd, m_eye_tex[eye].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            snd_probe::add(cmd, *snd_slot, eye == 0 ? "eye0_post" : "eye1_post", m_eye_tex[eye].Get());
+            barrier(cmd, m_eye_tex[eye].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+    }
 
     // --- Full-screen-GUI coverage reduction (independent of HUD mode) --------
     // Average the UI's alpha coverage to the 1x1 target and copy it into this
