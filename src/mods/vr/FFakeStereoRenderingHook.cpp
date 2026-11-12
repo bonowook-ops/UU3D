@@ -23779,21 +23779,22 @@ void note_adjust_view_rect(int32_t index, int in_x, int in_y, uint32_t in_w, uin
 thread_local uint32_t t_routes_in_draw{};
 thread_local uint32_t t_route_events_in_draw{};
 thread_local uint32_t t_render_texture_in_draw{};
-std::string g_last_route{};
-std::string g_last_draw_window{};
-std::string g_last_render_texture{};
+// diag4: keyed by "first time seen" instead of "differs from the previous
+// call" — diag3's alternating lookup/creation swaps filled the line budget.
+std::unordered_set<std::string> g_last_route{};
+std::unordered_set<std::string> g_last_draw_window{};
+std::unordered_set<std::string> g_last_render_texture{};
 std::atomic_uint64_t g_route_calls{};
 std::atomic_uint64_t g_draw_window_calls{};
 std::atomic_uint64_t g_render_texture_calls{};
 
-void log_on_change(std::string& last, const std::string& key, uint64_t call, const char* tag) {
+void log_on_change(std::unordered_set<std::string>& seen, const std::string& key, uint64_t call, const char* tag) {
     std::scoped_lock _{g_mutex};
-    const bool changed = key != last;
-    if ((changed || call <= 4 || call % 3000 == 0) && g_lines < k_max_lines) {
+    const bool is_new = seen.size() < 256 && seen.insert(key).second;
+    if ((is_new || call <= 4 || call % 3000 == 0) && g_lines < k_max_lines) {
         ++g_lines;
-        SPDLOG_INFO("[SND diag1][{}] call={} frame={} {}{}", tag, call, g_frame_count, key, changed ? " CHANGED" : "");
+        SPDLOG_INFO("[SND diag1][{}] call={} frame={} {}{}", tag, call, g_frame_count, key, is_new ? " NEW" : "");
     }
-    last = key;
 }
 
 void note_route(bool lookup, bool fast, bool scene, bool window, bool replaced,
@@ -23811,7 +23812,10 @@ void note_route(bool lookup, bool fast, bool scene, bool window, bool replaced,
     log_on_change(g_last_route, key, call, "SlateRoute");
 }
 
+std::atomic_uint32_t g_slate_render_thread_id{};
+
 void begin_draw_window() {
+    g_slate_render_thread_id.store(GetCurrentThreadId(), std::memory_order_relaxed);
     t_routes_in_draw = 0;
     t_route_events_in_draw = 0;
     t_render_texture_in_draw = 0;
@@ -23855,6 +23859,87 @@ void note_render_texture(FRHITexture2D* backbuffer, FRHITexture2D* src) {
     const auto key = fmt::format("inside_snd_draw_window={} backbuffer=[{}] src=[{}]",
         g_stupid_never_dies_slate_scope.graph != 0, describe(backbuffer), describe(src));
     log_on_change(g_last_render_texture, key, call, "RenderTexture");
+}
+
+// diag4: the Slate DrawWindow picks its output from
+// ViewportInfo->RenderTargetProvider (FViewportInfo+0x20) vfunc 0,
+// GetViewportRenderTargetTexture(); the game-viewport widget gets the scene
+// texture from the same FSceneViewport function. Hook that function body
+// (logging only, original result returned unchanged) and record which thread
+// and caller asks for it and whether it hands out the scene render target.
+safetyhook::InlineHook g_viewport_rt_hook{};
+std::atomic_bool g_viewport_rt_hook_attempted{};
+std::unordered_set<std::string> g_seen_viewport_rt{};
+std::atomic_uint64_t g_viewport_rt_calls{};
+
+void* viewport_rt_detour(void* self);
+
+void note_viewport_rt(void* self, void* result, uintptr_t caller) {
+    const auto call = g_viewport_rt_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto exe = reinterpret_cast<uintptr_t>(utility::get_executable());
+    const auto caller_rva = caller >= exe ? caller - exe : 0;
+    uintptr_t rhi{};
+    if (result != nullptr) {
+        safe_read_value(reinterpret_cast<uintptr_t>(result) + 8, rhi);
+    }
+    auto* const rtm = g_hook != nullptr ? g_hook->get_render_target_manager() : nullptr;
+    const char* who = result == nullptr ? "null" : rhi == 0 ? "no-rhi" : rtm == nullptr ? "?" :
+        rhi == reinterpret_cast<uintptr_t>(rtm->get_render_target()) ? "scene_rt" :
+        rhi == reinterpret_cast<uintptr_t>(rtm->get_ui_target()) ? "ui_target" : "other";
+    const auto tid = GetCurrentThreadId();
+    const char* thread = tid == g_slate_render_thread_id.load(std::memory_order_relaxed) ? "slate_render_thread" : "other_thread";
+    const auto key = fmt::format("thread={} inside_snd_draw_window={} caller=exe+{:x} self={:x} returns={}",
+        thread, g_stupid_never_dies_slate_scope.graph != 0, caller_rva, reinterpret_cast<uintptr_t>(self), who);
+    log_on_change(g_seen_viewport_rt, key, call, "ViewportRT");
+}
+
+void* viewport_rt_detour(void* self) {
+    auto* const result = g_viewport_rt_hook.call<void*>(self);
+    note_viewport_rt(self, result, reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    return result;
+}
+
+void ensure_viewport_rt_hook(uintptr_t viewport_info) {
+    if (g_viewport_rt_hook_attempted.exchange(true)) {
+        return;
+    }
+    uintptr_t provider{}, vtable{}, entry{};
+    if (!safe_read_value(viewport_info + 0x20, provider) || provider == 0 ||
+        !safe_read_value(provider, vtable) || !safe_read_value(vtable, entry) ||
+        !is_executable_process_range(entry, 16)) {
+        SPDLOG_WARN("[SND diag1][ViewportRT] could not read ViewportInfo+0x20 provider vfunc 0; not hooked");
+        return;
+    }
+    // Follow an MSVC this-adjustor thunk (sub/add rcx, imm; jmp body) to the body,
+    // so calls through any of FSceneViewport's interfaces are seen.
+    auto body = entry;
+    const auto* code = reinterpret_cast<const uint8_t*>(entry);
+    size_t skip = 0;
+    if (code[0] == 0x48 && (code[1] == 0x83 || code[1] == 0x81) && (code[2] == 0xE9 || code[2] == 0xC1)) {
+        skip = code[1] == 0x83 ? 4 : 7;
+    }
+    if (code[skip] == 0xE9) {
+        int32_t rel{};
+        std::memcpy(&rel, code + skip + 1, 4);
+        body = entry + skip + 5 + rel;
+    } else if (skip != 0) {
+        SPDLOG_WARN("[SND diag1][ViewportRT] adjustor thunk at {:x} without a jmp; not hooked", entry);
+        return;
+    }
+    const auto exe = reinterpret_cast<uintptr_t>(utility::get_executable());
+    if (utility::get_module_within(body).value_or(nullptr) != utility::get_executable() ||
+        !is_executable_process_range(body, 16)) {
+        SPDLOG_WARN("[SND diag1][ViewportRT] body {:x} is not executable game code; not hooked", body);
+        return;
+    }
+    // Create disabled and enable only after the trampoline is stored, so a
+    // concurrent call can never reach the detour before .call() is usable.
+    g_viewport_rt_hook = safetyhook::create_inline(reinterpret_cast<void*>(body), &viewport_rt_detour,
+        safetyhook::InlineHook::StartDisabled);
+    const bool created = static_cast<bool>(g_viewport_rt_hook);
+    const bool enabled = created && g_viewport_rt_hook.enable().has_value();
+    SPDLOG_INFO("[SND diag1][ViewportRT] provider={:x} vtable=exe+{:x} entry=exe+{:x} thunk_skip={} body=exe+{:x} created={} enabled={}",
+        provider, vtable - exe, entry - exe, skip, body - exe, created, enabled);
 }
 
 void note_scene_view(size_t stage, sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options) {
@@ -38608,6 +38693,7 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         }
         const auto& mods = g_framework->get_mods()->get_mods();
         for (auto& mod : mods) { mod->on_pre_slate_draw_window(renderer, reinterpret_cast<void*>(commands), reinterpret_cast<sdk::FViewportInfo*>(in->viewport_info)); }
+        snd_diag1::ensure_viewport_rt_hook(in->viewport_info);
         snd_diag1::begin_draw_window();
         const auto ret = g_hook->m_slate_thread_hook.call<void*>(renderer, a2, a3, a4, params, unk1, unk2);
         snd_diag1::end_draw_window(redirect_ui, *in);
