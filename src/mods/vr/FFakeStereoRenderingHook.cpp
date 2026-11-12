@@ -23773,6 +23773,90 @@ void note_adjust_view_rect(int32_t index, int in_x, int in_y, uint32_t in_w, uin
     g_last_adjust[slot] = key;
 }
 
+// diag3: which Slate output the SND hook swaps for the UI target, how often per
+// DrawWindow, and whether the engine's stereo present (RenderTexture_RenderThread)
+// runs inside that DrawWindow and with which textures. Logging only.
+thread_local uint32_t t_routes_in_draw{};
+thread_local uint32_t t_route_events_in_draw{};
+thread_local uint32_t t_render_texture_in_draw{};
+std::string g_last_route{};
+std::string g_last_draw_window{};
+std::string g_last_render_texture{};
+std::atomic_uint64_t g_route_calls{};
+std::atomic_uint64_t g_draw_window_calls{};
+std::atomic_uint64_t g_render_texture_calls{};
+
+void log_on_change(std::string& last, const std::string& key, uint64_t call, const char* tag) {
+    std::scoped_lock _{g_mutex};
+    const bool changed = key != last;
+    if ((changed || call <= 4 || call % 3000 == 0) && g_lines < k_max_lines) {
+        ++g_lines;
+        SPDLOG_INFO("[SND diag1][{}] call={} frame={} {}{}", tag, call, g_frame_count, key, changed ? " CHANGED" : "");
+    }
+    last = key;
+}
+
+void note_route(bool lookup, bool fast, bool scene, bool window, bool replaced,
+                const D3D12_RESOURCE_DESC* original, const D3D12_RESOURCE_DESC* ui) {
+    ++t_route_events_in_draw;
+    if (replaced) {
+        ++t_routes_in_draw;
+    }
+    const auto call = g_route_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto key = fmt::format("lookup={} fast={} original_is_scene_rt={} original_is_window={} replaced={} original={}x{} fmt={} ui={}x{} fmt={}",
+        lookup, fast, scene, window, replaced,
+        original != nullptr ? original->Width : 0, original != nullptr ? original->Height : 0,
+        original != nullptr ? (uint32_t)original->Format : 0,
+        ui != nullptr ? ui->Width : 0, ui != nullptr ? ui->Height : 0, ui != nullptr ? (uint32_t)ui->Format : 0);
+    log_on_change(g_last_route, key, call, "SlateRoute");
+}
+
+void begin_draw_window() {
+    t_routes_in_draw = 0;
+    t_route_events_in_draw = 0;
+    t_render_texture_in_draw = 0;
+}
+
+void end_draw_window(bool redirect_ui, const uevr::stupid_never_dies_ui::Inputs& in) {
+    const auto call = g_draw_window_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto key = fmt::format(
+        "redirect_ui={} rect={},{},{},{} scale={:.3f} post_process_requests={} route_events={} replaced={} render_texture_calls={}",
+        redirect_ui, in.min_x, in.min_y, in.max_x, in.max_y, in.scale, in.request_count,
+        t_route_events_in_draw, t_routes_in_draw, t_render_texture_in_draw);
+    log_on_change(g_last_draw_window, key, call, "DrawWindow");
+}
+
+void note_render_texture(FRHITexture2D* backbuffer, FRHITexture2D* src) {
+    ++t_render_texture_in_draw;
+    const auto call = g_render_texture_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto* const rtm = g_hook != nullptr ? g_hook->get_render_target_manager() : nullptr;
+    const auto describe = [&](FRHITexture2D* texture) -> std::string {
+        if (texture == nullptr) {
+            return "null";
+        }
+        if (!uevr::buffered_rt::readable_texture(reinterpret_cast<uintptr_t>(texture))) {
+            return "unreadable";
+        }
+        ID3D12Resource* native{};
+        try {
+            native = reinterpret_cast<ID3D12Resource*>(texture->get_native_resource());
+        } catch (...) {
+            native = nullptr;
+        }
+        D3D12_RESOURCE_DESC desc{};
+        if (native == nullptr || !get_d3d12_resource_desc_guarded(native, desc)) {
+            return "no-desc";
+        }
+        const char* who = rtm == nullptr ? "?" :
+            texture == rtm->get_ui_target() ? "ui_target" :
+            texture == rtm->get_render_target() ? "scene_rt" : "other";
+        return fmt::format("{} {}x{} fmt={}", who, desc.Width, desc.Height, (uint32_t)desc.Format);
+    };
+    const auto key = fmt::format("inside_snd_draw_window={} backbuffer=[{}] src=[{}]",
+        g_stupid_never_dies_slate_scope.graph != 0, describe(backbuffer), describe(src));
+    log_on_change(g_last_render_texture, key, call, "RenderTexture");
+}
+
 void note_scene_view(size_t stage, sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options) {
     if (!stupid_never_dies_dx12_runtime() || init_options == nullptr) {
         return;
@@ -32346,6 +32430,10 @@ __forceinline void FFakeStereoRenderingHook::render_texture_render_thread(FFakeS
     SPDLOG_INFO_ONCE("render texture render thread called!");
 #endif
 
+    if (stupid_never_dies_dx12_runtime()) {
+        snd_diag1::note_render_texture(backbuffer, src_texture);
+    }
+
 
     if (!g_hook->is_slate_hooked() && g_hook->has_attempted_to_hook_slate()) {
         SPDLOG_INFO("Attempting to hook SlateRHIRenderer::DrawWindow_RenderThread using RenderTexture_RenderThread return address...");
@@ -34744,6 +34832,7 @@ void FFakeStereoRenderingHook::stupid_never_dies_ui_hook(safetyhook::Context& ct
     if (!ui || ui != rtm->get_ui_target() || ui == rtm->get_render_target() || !original) { return; }
     if (scope.validated_original == ctx.rdx && scope.validated_ui == reinterpret_cast<uintptr_t>(ui)) {
         ctx.rdx = scope.validated_ui;
+        snd_diag1::note_route(lookup, true, false, false, true, nullptr, nullptr);
         return;
     }
     const auto native = [](FRHITexture2D* texture) -> ID3D12Resource* {
@@ -34787,6 +34876,8 @@ void FFakeStereoRenderingHook::stupid_never_dies_ui_hook(safetyhook::Context& ct
     const bool scene = vr && original == rtm->get_render_target() &&
         original_desc.Width == uint64_t(vr->get_hmd_width()) * 2 && original_desc.Height == vr->get_hmd_height();
     const bool window = original_desc.Width == scope.width && original_desc.Height == scope.height;
+    const bool snd_will_replace = (scene || window) && uevr::stupid_never_dies_ui::ui_target(ui_desc, scope.width, scope.height);
+    snd_diag1::note_route(lookup, false, scene, window, snd_will_replace, &original_desc, &ui_desc);
     if (!scene && !window) { return; }
     if (rtm->request_stupid_never_dies_ui_resize(ui_desc, {scope.width, scope.height})) {
         g_hook->set_should_recreate_textures(true);
@@ -38517,7 +38608,9 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         }
         const auto& mods = g_framework->get_mods()->get_mods();
         for (auto& mod : mods) { mod->on_pre_slate_draw_window(renderer, reinterpret_cast<void*>(commands), reinterpret_cast<sdk::FViewportInfo*>(in->viewport_info)); }
+        snd_diag1::begin_draw_window();
         const auto ret = g_hook->m_slate_thread_hook.call<void*>(renderer, a2, a3, a4, params, unk1, unk2);
+        snd_diag1::end_draw_window(redirect_ui, *in);
         for (auto& mod : mods) { mod->on_post_slate_draw_window(renderer, reinterpret_cast<void*>(commands), reinterpret_cast<sdk::FViewportInfo*>(in->viewport_info)); }
         return ret;
     }
