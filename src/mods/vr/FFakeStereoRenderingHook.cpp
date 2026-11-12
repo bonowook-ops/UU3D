@@ -2927,6 +2927,88 @@ bool install(std::vector<uintptr_t>& shadow_vtable) {
 }
 } // namespace swzc_diag4
 
+// SWZC diag5 (logging only): with depth of field the right eye fills with
+// broken data, and with TAA/TSR/DLSS the right eye stops updating. Record
+// what each eye's FSceneView is built from (view state, exposure state,
+// family, rects, projection) right before the engine constructor runs, so
+// the left and right eye can be compared. Nothing is modified.
+namespace swzc_diag5 {
+std::once_flag g_layout_once{};
+std::mutex g_mutex{};
+std::array<std::string, 4> g_last{};
+std::atomic_uint64_t g_calls{};
+uint32_t g_lines{};
+constexpr uint32_t k_max_lines = 3000;
+
+void note_view(void* view, sdk::FSceneViewInitOptions* init_options) {
+    if (!sw_zero_company_ue56_is_current_game() || init_options == nullptr) {
+        return;
+    }
+
+    using Options = sdk::FSceneViewInitOptionsUE56;
+    const auto call = g_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    std::call_once(g_layout_once, [] {
+        const auto* const layout = sdk::FSceneViewInitOptionsBase::get_layout_snapshot();
+        const auto opt = [](const std::optional<uint32_t>& v) { return v.has_value() ? fmt::format("{:x}", *v) : std::string{"-"}; };
+        SPDLOG_INFO("[SWZC diag5] init-options layout: discovered family={} state={} pass={} player={} | static UE5.6 rect={:x} crect={:x} "
+                    "family={:x} state={:x} exposure_state={:x} pass={:x} size={:x}",
+            layout != nullptr ? opt(layout->view_family) : "-",
+            layout != nullptr ? opt(layout->scene_state) : "-",
+            layout != nullptr ? opt(layout->stereo_pass) : "-",
+            layout != nullptr ? opt(layout->player_index) : "-",
+            offsetof(Options, view_rect), offsetof(Options, constrained_view_rect), offsetof(Options, family),
+            offsetof(Options, scene_view_state), offsetof(Options, exposure_scene_view_state), offsetof(Options, stereo_pass),
+            sizeof(Options));
+    });
+
+    alignas(16) std::array<uint8_t, sizeof(Options)> raw{};
+    if (!swzc_diag4::safe_copy(raw.data(), init_options, raw.size())) {
+        return;
+    }
+    const auto* const o = reinterpret_cast<const Options*>(raw.data());
+
+    const auto pass = init_options->get_stereo_pass();
+    const auto slot = pass < 3 ? static_cast<size_t>(pass) : size_t{3};
+
+    const auto* const proj = reinterpret_cast<const double*>(&o->projection_matrix);
+    bool proj_bad = false;
+    std::string proj_text{};
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(proj[i])) {
+            proj_bad = true;
+        }
+        proj_text += fmt::format("{}{:.6g}", i == 0 ? "" : ",", proj[i]);
+    }
+
+    const auto key = fmt::format(
+        "family={:x} state={:x} exposure_state={:x} player={} rect={},{},{},{} crect={},{},{},{} proj=[{}]{}",
+        reinterpret_cast<uintptr_t>(o->family),
+        reinterpret_cast<uintptr_t>(o->scene_view_state),
+        reinterpret_cast<uintptr_t>(o->exposure_scene_view_state),
+        o->player_index,
+        o->view_rect[0], o->view_rect[1], o->view_rect[2], o->view_rect[3],
+        o->constrained_view_rect[0], o->constrained_view_rect[1], o->constrained_view_rect[2], o->constrained_view_rect[3],
+        proj_text,
+        proj_bad ? " PROJ_NOT_FINITE" : "");
+
+    std::scoped_lock _{g_mutex};
+    if (g_lines >= k_max_lines) {
+        return;
+    }
+
+    const bool changed = key != g_last[slot];
+    if (changed || call <= 6 || call % 1200 == 0) {
+        ++g_lines;
+        SPDLOG_INFO("[SWZC diag5] view call={} pass={} view={:x} origin={:.1f},{:.1f},{:.1f}{} {}",
+            call, pass, reinterpret_cast<uintptr_t>(view),
+            o->view_origin.x, o->view_origin.y, o->view_origin.z,
+            changed ? " CHANGED" : "", key);
+        g_last[slot] = key;
+    }
+}
+} // namespace swzc_diag5
+
 
 bool bodycam_ue554_is_current_game() {
     static const bool result = []() {
@@ -25455,6 +25537,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     last_index++;
 
+    swzc_diag5::note_view(view, init_options);
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
 
     if (vr->is_native_stereo_fix_enabled()) {
