@@ -44266,11 +44266,27 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     } else if (sdk::kh3::is_process() && g_framework->is_dx11() && VR::get()->is_native_stereo_fix_enabled()) {
         tgt_raw = create_kh3_native_capture_target(ugs, world, target_width, target_height);
     } else if (kismet_rendering != nullptr) {
+        // ETextureRenderTargetFormat: 2 = RTF_RGBA8 (BGRA8), 10 = RTF_RGB10A2.
+        // SW Zero Company keeps its scene target in R10G10B10A2, and the Flat3D
+        // compositor copies this capture (the right eye under Native Stereo
+        // Fix) straight into an eye cache of the scene's format. A BGRA8
+        // capture makes that CopyTextureRegion cross-format, so every
+        // compositor command list fails Close() with E_INVALIDARG (diag3).
+        // Match the scene's format there; every other game/output keeps RGBA8.
+        constexpr uint8_t rtf_rgba8 = 2;
+        constexpr uint8_t rtf_rgb10a2 = 10;
+        const bool swzc_flat3d_capture =
+            sw_zero_company_ue56_is_current_game() && VR::get()->is_using_flat3d();
+        if (swzc_flat3d_capture) {
+            SPDLOG_INFO_ONCE(
+                "[SWZeroCompany][UE5.6][Flat3D] Creating the Native Stereo Fix scene capture as RTF_RGB10A2 to match "
+                "the R10G10B10A2 scene target");
+        }
         tgt_raw = kismet_rendering->create_render_target_2d(
             world,
             target_width,
             target_height,
-            2,
+            swzc_flat3d_capture ? rtf_rgb10a2 : rtf_rgba8,
             clear_color,
             false);
     } else {
