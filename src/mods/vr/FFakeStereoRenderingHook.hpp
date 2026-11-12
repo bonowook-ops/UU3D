@@ -2106,3 +2106,14 @@ private:
 
     friend class IXRTrackingSystemHook;
 };
+
+// SW Zero Company (UE5.6, revision-validated layout) only: the native D3D12
+// resource behind an RHI texture, for the Flat3D output path. Returns false
+// when this is not SW Zero Company; callers then keep using the generic
+// FRHITexture::get_native_resource(). When it returns true, out_native is the
+// resource or nullptr and callers must NOT fall back to the generic getter:
+// its UE5.5/5.6 discovery calls vtable slot 4 first, which in this build is
+// the hidden-sret GetDefaultBindlessHandle, and that call faults forever.
+// UI targets use the pinned dedicated UI resource first, as the VR path does.
+bool sw_zero_company_flat3d_native_resource(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                            ID3D12Resource*& out_native);

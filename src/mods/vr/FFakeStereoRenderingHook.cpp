@@ -3024,7 +3024,10 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
         src_desc.Width == packed_width && src_desc.Height == packed_height &&
         dst_desc.Width == trusted_desktop_width &&
         dst_desc.Height == trusted_desktop_height &&
-        src_desc.Width > dst_desc.Width && src_desc.Height > dst_desc.Height &&
+        // Height may be equal: on a flat 3D display (UU3D Flat3D) each eye is
+        // rendered at the desktop height, so the packed source is wider but
+        // not taller, and the full-box copy is just as invalid.
+        src_desc.Width > dst_desc.Width && src_desc.Height >= dst_desc.Height &&
         src_desc.DepthOrArraySize == 1 && dst_desc.DepthOrArraySize == 1 &&
         src_desc.MipLevels == 1 && dst_desc.MipLevels == 1 &&
         src_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
@@ -7473,6 +7476,49 @@ bool ue55_dx12_try_get_native_resource_direct(
     return false;
 }
 
+bool sw_zero_company_flat3d_native_resource_impl(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                                 ID3D12Resource*& out_native)
+{
+    out_native = nullptr;
+
+    if (!sw_zero_company_ue56_is_current_game() || !is_ue_5_6_dx12_backend()) {
+        return false;
+    }
+
+    if (texture == nullptr) {
+        return true;
+    }
+
+    if (is_ui_target && g_hook != nullptr) {
+        if (auto* const rtm = g_hook->get_render_target_manager(); rtm != nullptr) {
+            ID3D12Resource* pinned{};
+            if (rtm->try_get_sw_zero_company_pinned_ui_resource(texture, pinned)) {
+                out_native = pinned;
+                return true;
+            }
+        }
+    }
+
+    // Only the byte-validated slot-5 accessor; never a blind slot probe.
+    const auto* const layout = sw_zero_company_ue56_binary_layout();
+    if (layout == nullptr || layout->native_resource == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(5,
+            "[SWZeroCompany][UE5.6][Flat3D] No validated GetNativeResource layout for {}; not probing tex={:x}",
+            source != nullptr ? source : "<unknown>", reinterpret_cast<uintptr_t>(texture));
+        return true;
+    }
+
+    ID3D12Resource* native{};
+    if (ue55_dx12_try_get_native_resource_direct(texture, source, &native, nullptr)) {
+        out_native = native;
+    }
+
+    SPDLOG_INFO_ONCE(
+        "[SWZeroCompany][UE5.6][Flat3D] Using the validated GetNativeResource accessor for Flat3D output; "
+        "the SDK's generic slot discovery is not used");
+    return true;
+}
+
 constexpr std::string_view BODYCAM_UE554_SCENE_VIEWPORT_SOURCE =
     "Bodycam FSceneViewport::InitRHI post";
 
@@ -9673,6 +9719,15 @@ std::optional<uint32_t> resolve_post_init_properties_index_from_uobject(uintptr_
     SPDLOG_WARN("[PostInitProperties] Could not validate the expected UObject::PostInitProperties slots on this build");
     return std::nullopt;
 }
+}
+
+// External entry point (declared in FFakeStereoRenderingHook.hpp) for the
+// Flat3D output path; the implementation lives in this file's anonymous
+// namespace next to the validated accessor it uses.
+bool sw_zero_company_flat3d_native_resource(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                            ID3D12Resource*& out_native)
+{
+    return sw_zero_company_flat3d_native_resource_impl(texture, source, is_ui_target, out_native);
 }
 
 namespace {
@@ -44143,11 +44198,27 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     } else if (sdk::kh3::is_process() && g_framework->is_dx11() && VR::get()->is_native_stereo_fix_enabled()) {
         tgt_raw = create_kh3_native_capture_target(ugs, world, target_width, target_height);
     } else if (kismet_rendering != nullptr) {
+        // ETextureRenderTargetFormat: 2 = RTF_RGBA8 (BGRA8), 10 = RTF_RGB10A2.
+        // SW Zero Company keeps its scene target in R10G10B10A2, and the Flat3D
+        // compositor copies this capture (the right eye under Native Stereo
+        // Fix) straight into an eye cache of the scene's format. A BGRA8
+        // capture makes that CopyTextureRegion cross-format, so every
+        // compositor command list fails Close() with E_INVALIDARG.
+        // Match the scene's format there; every other game/output keeps RGBA8.
+        constexpr uint8_t rtf_rgba8 = 2;
+        constexpr uint8_t rtf_rgb10a2 = 10;
+        const bool swzc_flat3d_capture =
+            sw_zero_company_ue56_is_current_game() && VR::get()->is_using_flat3d();
+        if (swzc_flat3d_capture) {
+            SPDLOG_INFO_ONCE(
+                "[SWZeroCompany][UE5.6][Flat3D] Creating the Native Stereo Fix scene capture as RTF_RGB10A2 to match "
+                "the R10G10B10A2 scene target");
+        }
         tgt_raw = kismet_rendering->create_render_target_2d(
             world,
             target_width,
             target_height,
-            2,
+            swzc_flat3d_capture ? rtf_rgb10a2 : rtf_rgba8,
             clear_color,
             false);
     } else {
