@@ -76,7 +76,7 @@ struct Row {
 };
 
 struct Slot {
-    ComPtr<ID3D12Resource> rb{};
+    Microsoft::WRL::ComPtr<ID3D12Resource> rb{};
     ID3D12Device* device{};
     Row rows[kMaxRows]{};
     uint32_t count{};
