@@ -14,6 +14,7 @@
 #include "../GameDepthCapture.hpp"
 
 #include "../D3D12Component.hpp"
+#include "SndDiag.hpp"
 
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
@@ -972,6 +973,29 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     // runs) the present the hotkey / menu button fired.
     if (vr->get_flat3d_runtime()->screenshot_requested.exchange(false)) {
         m_flat3d_compositor.begin_screenshot();
+    }
+
+    // SND diag1 (logging only): the composite's inputs, logged when they change.
+    if (flat3d::snd_diag::enabled()) {
+        static std::string s_last{};
+        static uint32_t s_lines = 0;
+        const auto second_desc = second_eye_src != nullptr ? second_eye_src->GetDesc() : D3D12_RESOURCE_DESC{};
+        const auto ui_desc = ui_tex != nullptr ? ui_tex->GetDesc() : D3D12_RESOURCE_DESC{};
+        const auto& d3d12_hook = g_framework->get_d3d12_hook();
+        const auto key = fmt::format(
+            "dw={}x{} fmt={} bb={}x{} fmt={} eye={}x{} single_width_src={} hmd={}x{} mode={} afr_frame={} synced_pair={} "
+            "native_stereo_layout={} warp_frame={} second={}x{} ui={}x{} engine_believed={}x{} scene_scale={:.3f}",
+            dw_desc.Width, dw_desc.Height, (uint32_t)dw_desc.Format, bb_desc.Width, bb_desc.Height, (uint32_t)bb_desc.Format,
+            eye_w, eye_h, single_width_src, vr->get_hmd_width(), vr->get_hmd_height(), params.mode, params.afr_frame,
+            params.afr_synced_pair, params.native_stereo_layout, params.warp_frame, second_desc.Width, second_desc.Height,
+            ui_desc.Width, ui_desc.Height,
+            d3d12_hook != nullptr ? d3d12_hook->get_engine_believed_width() : 0,
+            d3d12_hook != nullptr ? d3d12_hook->get_engine_believed_height() : 0, params.scene_scale);
+        if (key != s_last && s_lines < 500) {
+            ++s_lines;
+            spdlog::info("[SND diag1][Composite] frame={} {}", vr->m_render_frame_count, key);
+        }
+        s_last = key;
     }
 
     const bool composited = m_flat3d_compositor.composite(double_wide.Get(), second_eye_src, ui_tex, menu_tex,

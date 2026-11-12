@@ -19,6 +19,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Flat3DCompositorD3D12.hpp"
+#include "SndDiag.hpp"
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
 // No SR SDK headers here: everything goes through SR-lib's facade, which keeps
@@ -52,6 +53,203 @@ void barrier(ID3D12GraphicsCommandList* cmd, ID3D12Resource* res,
     b.Transition.StateAfter = after;
     cmd->ResourceBarrier(1, &b);
 }
+
+// Stupid Never Dies diag1 (logging only): the scene fills only the left half
+// of each eye. Every few seconds copy three pixel rows (25/50/75% height) of
+// the engine double-wide, the per-eye caches and the final backbuffer into a
+// readback buffer, and log where the non-black pixels are. This tells whether
+// the engine already rendered only half the width or whether the composite
+// loses it. Gated to the one title; nothing that reaches the screen changes.
+namespace snd_probe {
+constexpr uint32_t kSlots = 8;
+constexpr uint32_t kMaxRows = 24;
+constexpr uint64_t kBytes = 4ull << 20;
+constexpr uint64_t kIntervalMs = 5000;
+constexpr uint32_t kMaxProbes = 400;
+
+struct Row {
+    char src[8]{};
+    uint32_t w{}, h{}, y{};
+    DXGI_FORMAT fmt{};
+    uint32_t bpp{};
+    uint64_t offset{};
+};
+
+struct Slot {
+    ComPtr<ID3D12Resource> rb{};
+    ID3D12Device* device{};
+    Row rows[kMaxRows]{};
+    uint32_t count{};
+    uint64_t used{};
+    bool pending{};
+    std::string header{};
+};
+
+Slot g_slots[kSlots]{};
+uint64_t g_next_ms{};
+uint32_t g_probes{};
+bool g_disabled{};
+
+uint32_t bytes_per_pixel(DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return 4;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+// "Non-black" = any colour channel clearly above zero (~3% in 8-bit, ~0.016 in float).
+bool lit(const uint8_t* p, DXGI_FORMAT f) {
+    switch (f) {
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM: {
+        uint32_t v{}; std::memcpy(&v, p, 4);
+        return (v & 0x3ff) > 32 || ((v >> 10) & 0x3ff) > 32 || ((v >> 20) & 0x3ff) > 32;
+    }
+    case DXGI_FORMAT_R11G11B10_FLOAT: {
+        uint32_t v{}; std::memcpy(&v, p, 4);
+        return ((v >> 6) & 0x1f) >= 9 || ((v >> 17) & 0x1f) >= 9 || ((v >> 27) & 0x1f) >= 9;
+    }
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+        for (int c = 0; c < 3; ++c) {
+            uint16_t h{}; std::memcpy(&h, p + c * 2, 2);
+            if ((h & 0x8000) == 0 && ((h >> 10) & 0x1f) >= 9) { return true; }
+        }
+        return false;
+    }
+    default:
+        return p[0] > 8 || p[1] > 8 || p[2] > 8;
+    }
+}
+
+bool begin(Slot& s, ID3D12Device* device, std::string header) {
+    s.count = 0;
+    s.used = 0;
+    if (s.rb == nullptr || s.device != device) {
+        s.rb.Reset();
+        s.device = device;
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = kBytes;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr, IID_PPV_ARGS(&s.rb)))) {
+            spdlog::error("[SND diag1][probe] readback buffer creation failed; probe disabled");
+            g_disabled = true;
+            return false;
+        }
+    }
+    s.header = std::move(header);
+    return true;
+}
+
+// res must already be in COPY_SOURCE.
+void add(ID3D12GraphicsCommandList* cmd, Slot& s, const char* name, ID3D12Resource* res) {
+    if (res == nullptr || s.rb == nullptr) {
+        return;
+    }
+    const auto d = res->GetDesc();
+    const uint32_t bpp = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 &&
+        d.DepthOrArraySize == 1 ? bytes_per_pixel(d.Format) : 0;
+    const uint32_t ys[3]{d.Height / 4, d.Height / 2, (d.Height * 3) / 4};
+    for (const auto y : ys) {
+        if (s.count >= kMaxRows) {
+            return;
+        }
+        auto& r = s.rows[s.count++];
+        strncpy_s(r.src, name, _TRUNCATE);
+        r.w = (uint32_t)d.Width;
+        r.h = d.Height;
+        r.y = y;
+        r.fmt = d.Format;
+        r.bpp = bpp;
+        r.offset = UINT64_MAX;
+        if (bpp == 0) {
+            continue; // logged as an unsupported format
+        }
+        const uint64_t pitch = ((uint64_t)d.Width * bpp + 255) & ~255ull;
+        const uint64_t offset = (s.used + 511) & ~511ull;
+        if (offset + pitch > kBytes) {
+            continue;
+        }
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = s.rb.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = offset;
+        dst.PlacedFootprint.Footprint.Format = d.Format;
+        dst.PlacedFootprint.Footprint.Width = (UINT)d.Width;
+        dst.PlacedFootprint.Footprint.Height = 1;
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = (UINT)pitch;
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = res;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        const D3D12_BOX box{0, y, 0, (UINT)d.Width, y + 1, 1};
+        cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+        r.offset = offset;
+        s.used = offset + pitch;
+    }
+}
+
+void harvest(Slot& s) {
+    if (!s.pending) {
+        return;
+    }
+    s.pending = false;
+    void* data = nullptr;
+    const D3D12_RANGE read_range{0, (SIZE_T)s.used};
+    if (s.rb == nullptr || FAILED(s.rb->Map(0, &read_range, &data)) || data == nullptr) {
+        spdlog::warn("[SND diag1][probe] map failed");
+        return;
+    }
+    spdlog::info("[SND diag1][probe] {}", s.header);
+    for (uint32_t i = 0; i < s.count; ++i) {
+        const auto& r = s.rows[i];
+        if (r.offset == UINT64_MAX) {
+            spdlog::info("[SND diag1][probe]   {} {}x{} fmt={} y={}: not read (format unsupported or buffer full)",
+                r.src, r.w, r.h, (uint32_t)r.fmt, r.y);
+            continue;
+        }
+        const auto* row = (const uint8_t*)data + r.offset;
+        constexpr uint32_t kSeg = 16;
+        uint32_t seg_lit[kSeg]{};
+        uint32_t lit_total = 0;
+        int64_t first = -1, last = -1;
+        for (uint32_t x = 0; x < r.w; ++x) {
+            if (lit(row + (uint64_t)x * r.bpp, r.fmt)) {
+                ++seg_lit[(uint64_t)x * kSeg / r.w];
+                ++lit_total;
+                if (first < 0) { first = x; }
+                last = x;
+            }
+        }
+        // Per-sixteenth fill: '#' >= 90% lit, '0'..'9' tenths, '.' nothing lit.
+        char fill[kSeg + 1]{};
+        for (uint32_t k = 0; k < kSeg; ++k) {
+            const uint32_t seg_w = (uint32_t)(((uint64_t)(k + 1) * r.w) / kSeg - ((uint64_t)k * r.w) / kSeg);
+            const uint32_t tenth = seg_w > 0 ? seg_lit[k] * 10 / seg_w : 0;
+            fill[k] = seg_lit[k] == 0 ? '.' : tenth >= 9 ? '#' : (char)('0' + tenth);
+        }
+        spdlog::info("[SND diag1][probe]   {} {}x{} fmt={} y={}: fill=[{}] lit={}/{} first_x={} last_x={}",
+            r.src, r.w, r.h, (uint32_t)r.fmt, r.y, fill, lit_total, r.w, first, last);
+    }
+    const D3D12_RANGE no_write{0, 0};
+    s.rb->Unmap(0, &no_write);
+}
+} // namespace snd_probe
 
 DXGI_FORMAT view_format_for(DXGI_FORMAT fmt) {
     switch (fmt) {
@@ -663,6 +861,29 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         *out_ui_coverage = m_coverage_ema;
     }
 
+    // SND diag1: harvest this slot's pixel-row probe (the fence wait above
+    // guarantees the copy finished), then decide whether this frame probes.
+    static_assert(kRing <= snd_probe::kSlots, "SND probe needs one slot per ring entry");
+    snd_probe::Slot* snd_slot = nullptr;
+    if (snd_diag::enabled() && !snd_probe::g_disabled) {
+        snd_probe::harvest(snd_probe::g_slots[slot]);
+        const auto now = GetTickCount64();
+        if (snd_probe::g_probes < snd_probe::kMaxProbes && now >= snd_probe::g_next_ms) {
+            snd_probe::g_next_ms = now + snd_probe::kIntervalMs;
+            ++snd_probe::g_probes;
+            const auto header = fmt::format(
+                "#{} frame={} mode={} afr_frame={} afr_left_eye={} synced_pair={} pair_second={} native_stereo_layout={} "
+                "warp_frame={} extreme={} eye={}x{} out={}x{} right_eye_src={} ui_tex={} scene_scale={:.3f} scene_shift_px={:.1f}",
+                snd_probe::g_probes, m_frame, params.mode, params.afr_frame, params.afr_left_eye, params.afr_synced_pair,
+                params.afr_pair_second, params.native_stereo_layout, params.warp_frame, params.extreme_backbuffer_src,
+                m_eye_w, m_eye_h, out_w, out_h, right_eye_src != nullptr, ui_tex != nullptr, params.scene_scale,
+                params.scene_shift_px);
+            if (snd_probe::begin(snd_probe::g_slots[slot], m_device, header)) {
+                snd_slot = &snd_probe::g_slots[slot];
+            }
+        }
+    }
+
     auto* cmd = ctx.cmd_list.Get();
 
     // --- 1. Refresh eye cache from the double-wide --------------------------
@@ -680,6 +901,12 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
 
     if (right_eye_src != nullptr) {
         barrier(cmd, right_eye_src, second_src_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+
+    if (snd_slot != nullptr) {
+        // Both sources are in COPY_SOURCE here: what the engine rendered.
+        snd_probe::add(cmd, *snd_slot, "dw", double_wide);
+        snd_probe::add(cmd, *snd_slot, "second", right_eye_src);
     }
 
     const auto copy_half = [&](int eye) {
@@ -823,6 +1050,16 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
 
     if (right_eye_src != nullptr) {
         barrier(cmd, right_eye_src, D3D12_RESOURCE_STATE_COPY_SOURCE, second_src_state);
+    }
+
+    if (snd_slot != nullptr) {
+        // Every branch above leaves both eye caches in RENDER_TARGET: the
+        // scene each eye will show, before any UI/menu overlay is drawn.
+        for (int eye = 0; eye < 2; ++eye) {
+            barrier(cmd, m_eye_tex[eye].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            snd_probe::add(cmd, *snd_slot, eye == 0 ? "eye0" : "eye1", m_eye_tex[eye].Get());
+            barrier(cmd, m_eye_tex[eye].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
     }
 
     // NOTE on overlays under AFR: the stale eye keeps last frame's UI baked
@@ -1485,6 +1722,13 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         barrier(cmd, backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
     }
 
+    if (snd_slot != nullptr) {
+        // The final packed output (scene + UI) as it goes to the display.
+        barrier(cmd, backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        snd_probe::add(cmd, *snd_slot, "bb", backbuffer);
+        barrier(cmd, backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    }
+
     // --- 4. Optional SceneDepthZ stripe readback -----------------------------
     if (params.want_depth && !m_depth_disabled && scene_depth != nullptr && nearz_uu > 0.0f) {
         const auto sd_desc = scene_depth->GetDesc();
@@ -1612,6 +1856,16 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
 
     ctx.has_commands = true;
     ctx.execute();
+
+    if (snd_slot != nullptr) {
+        if (ctx.last_close_failed) {
+            // Never let the diagnostic cost the composite more than this one frame.
+            snd_probe::g_disabled = true;
+            spdlog::error("[SND diag1][probe] command list failed to close with the probe recorded; probe disabled");
+        } else {
+            snd_slot->pending = snd_slot->count > 0;
+        }
+    }
 
     // Resilience: if a frame containing the depth readback failed to close,
     // permanently disable depth sampling for the session (auto-convergence /

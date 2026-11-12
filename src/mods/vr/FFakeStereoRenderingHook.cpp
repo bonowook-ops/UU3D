@@ -23741,8 +23741,79 @@ __declspec(noinline) bool try_read_view_family_and_scene(sdk::FSceneViewInitOpti
 }
 
 // FSceneView constructor hook
+// Stupid Never Dies diag1 (logging only): in Flat3D the scene fills only the
+// left half of each eye. Record the eye rectangles the engine is given
+// (AdjustViewRect in/out) and the rectangles each FSceneView is built from,
+// on change, so a half-width eye rectangle can be found. Nothing is modified.
+namespace snd_diag1 {
+std::mutex g_mutex{};
+uint32_t g_lines{};
+constexpr uint32_t k_max_lines = 4000;
+std::array<std::string, 8> g_last_adjust{};
+std::array<std::string, 16> g_last_view{};
+std::atomic_uint64_t g_adjust_calls{};
+std::atomic_uint64_t g_view_calls{};
+
+void note_adjust_view_rect(int32_t index, int in_x, int in_y, uint32_t in_w, uint32_t in_h,
+                           int out_x, int out_y, uint32_t out_w, uint32_t out_h) {
+    const auto call = g_adjust_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto vr = VR::get();
+    const auto key = fmt::format("in={},{} {}x{} out={},{} {}x{}", in_x, in_y, in_w, in_h, out_x, out_y, out_w, out_h);
+    const auto slot = index >= 0 && index < 7 ? static_cast<size_t>(index) : size_t{7};
+
+    std::scoped_lock _{g_mutex};
+    const bool changed = key != g_last_adjust[slot];
+    if ((changed || call <= 8 || call % 3000 == 0) && g_lines < k_max_lines) {
+        ++g_lines;
+        SPDLOG_INFO("[SND diag1][AdjustViewRect] call={} frame={} index={} afr={} synced={} nsf={} stereo_emu={} hmd={}x{} {}{}",
+            call, g_frame_count, index, vr->is_using_afr(), vr->is_using_synchronized_afr(),
+            vr->is_native_stereo_fix_enabled(), vr->is_stereo_emulation_enabled(),
+            vr->get_hmd_width(), vr->get_hmd_height(), key, changed ? " CHANGED" : "");
+    }
+    g_last_adjust[slot] = key;
+}
+
+void note_scene_view(size_t stage, sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options) {
+    if (!stupid_never_dies_dx12_runtime() || init_options == nullptr) {
+        return;
+    }
+
+    const auto call = g_view_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    using ProjectionDataUE50To53 = sdk::FSceneViewProjectionDataUE50To53;
+    using ProjectionDataUE54Plus = sdk::FSceneViewProjectionDataUE5T<double>;
+    const auto ue50_to_53 = is_ue_5_0_to_5_3_runtime();
+    ProjectionDataUE50To53 data_ue50_to_53{};
+    ProjectionDataUE54Plus data_ue54_plus{};
+    const auto readable = ue50_to_53
+        ? safe_read_value(reinterpret_cast<uintptr_t>(init_options), data_ue50_to_53)
+        : safe_read_value(reinterpret_cast<uintptr_t>(init_options), data_ue54_plus);
+    if (!readable) {
+        return;
+    }
+    const auto* const rect = ue50_to_53 ? data_ue50_to_53.view_rect : data_ue54_plus.view_rect;
+    const auto* const crect = ue50_to_53 ? data_ue50_to_53.constrained_view_rect : data_ue54_plus.constrained_view_rect;
+    const auto pass = init_options->get_stereo_pass();
+
+    const auto key = fmt::format("rect={},{},{},{} ({}x{}) crect={},{},{},{} ({}x{})",
+        rect[0], rect[1], rect[2], rect[3], rect[2] - rect[0], rect[3] - rect[1],
+        crect[0], crect[1], crect[2], crect[3], crect[2] - crect[0], crect[3] - crect[1]);
+    const auto slot = (stage & 1) * 8 + (pass < 7 ? static_cast<size_t>(pass) : size_t{7});
+
+    std::scoped_lock _{g_mutex};
+    const bool changed = key != g_last_view[slot];
+    if ((changed || call <= 8 || call % 3000 == 0) && g_lines < k_max_lines) {
+        ++g_lines;
+        SPDLOG_INFO("[SND diag1][SceneView] call={} frame={} stage={} pass={} view={:x} layout={} {}{}",
+            call, g_frame_count, stage == 0 ? "entry" : "final", pass, reinterpret_cast<uintptr_t>(view),
+            ue50_to_53 ? "ue50-53" : "ue54+", key, changed ? " CHANGED" : "");
+    }
+    g_last_view[slot] = key;
+}
+} // namespace snd_diag1
+
 sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
     SPDLOG_INFO_ONCE("Called FSceneView constructor for the first time");
+    snd_diag1::note_scene_view(0, view, init_options);
 
     auto& vr = VR::get();
 
@@ -25067,6 +25138,7 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
 
     last_index++;
 
+    snd_diag1::note_scene_view(1, view, init_options);
     auto result = g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
 
     if (vr->is_native_stereo_fix_enabled()) {
@@ -31126,6 +31198,19 @@ void FFakeStereoRenderingHook::adjust_view_rect(FFakeStereoRendering* stereo, in
     if (!g_framework->is_game_data_intialized()) {
         return;
     }
+
+    // SND diag1: log what the engine asked for and what we hand back, on every
+    // exit path below. Logging only.
+    const bool snd_diag1_on = stupid_never_dies_dx12_runtime();
+    const int snd_in_x = *x;
+    const int snd_in_y = *y;
+    const uint32_t snd_in_w = *w;
+    const uint32_t snd_in_h = *h;
+    utility::ScopeGuard snd_diag1_guard{[&]() {
+        if (snd_diag1_on) {
+            snd_diag1::note_adjust_view_rect(index, snd_in_x, snd_in_y, snd_in_w, snd_in_h, *x, *y, *w, *h);
+        }
+    }};
 
     static bool index_starts_from_one = true;
     const bool medium_one_based_eye_pass = medium_is_current_game();
