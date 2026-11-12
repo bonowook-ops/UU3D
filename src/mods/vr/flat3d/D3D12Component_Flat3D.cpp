@@ -15,6 +15,7 @@
 
 #include "../D3D12Component.hpp"
 #include "../FFakeStereoRenderingHook.hpp"
+#include "ExceptionHandler.hpp" // diag3: SWZeroCompany-only D3D12 observation
 
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
@@ -251,6 +252,8 @@ bool D3D12Component::run_afw_velocity_decode(VR* vr, const AfwVelocityDecodePara
         pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE;
         pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         cmd->ResourceBarrier(2, pre);
+        framework::swzc_diag_note_d3d12_copy("Flat3D depth copy (CopyResource)", p.depth->pTexture, 0, 0,
+                                             p.depth_copy_src, nullptr);
         cmd->CopyResource(p.depth->pTexture, p.depth_copy_src);
         D3D12_RESOURCE_BARRIER post[2]{pre[0], pre[1]};
         std::swap(post[0].Transition.StateBefore, post[0].Transition.StateAfter);
@@ -694,6 +697,8 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
 
     const auto dw_desc = double_wide->GetDesc();
     const auto bb_desc = real_backbuffer->GetDesc();
+    framework::swzc_diag_note_d3d12_resource("Flat3D scene target (double_wide)", double_wide.Get());
+    framework::swzc_diag_note_d3d12_resource("Flat3D real backbuffer", real_backbuffer.Get());
 
     // Single-width source: the whole texture is ONE eye (extreme compat, or the
     // single-view target above). Decided from the texture itself rather than the
@@ -749,6 +754,7 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
         if (scene_capture != nullptr) {
             right_eye_src = native_of(scene_capture, "Flat3D scene capture", false);
         }
+        framework::swzc_diag_note_d3d12_resource("Flat3D right-eye scene capture", right_eye_src.Get());
 
         // A stale capture (pre-resolution-change, mid-recreation) renders
         // into a corner of the eye — treat it as missing (stable mono) until
@@ -770,6 +776,7 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     if (ui_target != nullptr) {
         ui_tex = native_of(ui_target, "Flat3D UI target", true);
     }
+    framework::swzc_diag_note_d3d12_resource("Flat3D UI target", ui_tex);
 
     // The UI target must match the size the ENGINE draws Slate at — its own
     // requested resolution (the swapchain itself is held at native by the

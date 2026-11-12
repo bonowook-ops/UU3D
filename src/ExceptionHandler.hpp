@@ -47,6 +47,14 @@ struct SwzcCopyNote {
 };
 void swzc_diag_note_copy(const SwzcCopyNote& note);
 
+// diag3: D3D12 copy and resource observation for the Flat3D compositor.
+// `dst`/`src` are ID3D12Resource*; `box` is a D3D12_BOX* or nullptr (whole
+// resource / CopyResource). Logged once per distinct combination, flagged when
+// formats differ or the box does not fit. Observation only.
+void swzc_diag_note_d3d12_copy(const char* site, void* dst, unsigned dst_x, unsigned dst_y, void* src,
+                               const void* box);
+void swzc_diag_note_d3d12_resource(const char* site, void* resource);
+
 // Wraps engine->exec(command) with diag markers. Identical behavior: the
 // command runs exactly once and nothing is caught here (a try/catch would
 // change how an SEH exception unwinds under /EHa); a missing EXEC-END line

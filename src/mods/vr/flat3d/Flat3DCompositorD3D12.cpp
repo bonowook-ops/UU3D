@@ -19,6 +19,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Flat3DCompositorD3D12.hpp"
+#include "ExceptionHandler.hpp" // diag3: SWZeroCompany-only D3D12 copy observation
 
 #ifdef UEVR_FLAT3D_HAS_LEIASR_DX12
 // No SR SDK headers here: everything goes through SR-lib's facade, which keeps
@@ -724,6 +725,9 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         dst.pResource = m_eye_tex[eye].Get();
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
+        framework::swzc_diag_note_d3d12_copy(use_capture ? "compositor copy_half (right-eye capture -> eye cache)"
+                                                         : "compositor copy_half (scene -> eye cache)",
+                                             dst.pResource, 0, 0, src.pResource, &box);
         cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
 
         // Eyes that get overlay draws go to RENDER_TARGET; others back to PSR.
@@ -779,6 +783,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
                 dst.pResource = m_pair_pending.Get();
                 dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
+                framework::swzc_diag_note_d3d12_copy("compositor pair stash (scene -> pair_pending)", dst.pResource, 0, 0,
+                                                     src.pResource, &box);
                 cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
                 m_pair_pending_valid = true;
                 m_pair_pending_eye = fresh;
@@ -800,6 +806,9 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
             if (m_pair_pending_valid && m_pair_pending != nullptr && m_pair_pending_eye != fresh) {
                 barrier(cmd, m_eye_tex[m_pair_pending_eye].Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
                 barrier(cmd, m_pair_pending.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                framework::swzc_diag_note_d3d12_copy("compositor pair publish (CopyResource)",
+                                                     m_eye_tex[m_pair_pending_eye].Get(), 0, 0, m_pair_pending.Get(),
+                                                     nullptr);
                 cmd->CopyResource(m_eye_tex[m_pair_pending_eye].Get(), m_pair_pending.Get());
                 barrier(cmd, m_pair_pending.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
                 barrier(cmd, m_eye_tex[m_pair_pending_eye].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -1139,6 +1148,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
             barrier(cmd, m_hud_prev_ui.Get(),
                     m_hud_prev_valid ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_COPY_DEST);
+            framework::swzc_diag_note_d3d12_copy("compositor HUD prev UI (CopyResource)", m_hud_prev_ui.Get(), 0, 0,
+                                                 ui_tex, nullptr);
             cmd->CopyResource(m_hud_prev_ui.Get(), ui_tex);
             barrier(cmd, m_hud_prev_ui.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             barrier(cmd, ui_tex, D3D12_RESOURCE_STATE_COPY_SOURCE, kUiState);
@@ -1382,6 +1393,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
         cov_dst.PlacedFootprint.Footprint.Depth = 1;
         cov_dst.PlacedFootprint.Footprint.RowPitch = 256; // D3D12 min copy alignment
 
+        framework::swzc_diag_note_d3d12_copy("compositor coverage readback", cov_dst.pResource, 0, 0, cov_src.pResource,
+                                             nullptr);
         cmd->CopyTextureRegion(&cov_dst, 0, 0, 0, &cov_src, nullptr);
         m_coverage_copied[slot] = true;
     }
@@ -1598,6 +1611,8 @@ bool Flat3DCompositorD3D12::composite(ID3D12Resource* double_wide,
                     dst.PlacedFootprint.Footprint.Depth = 1;
                     dst.PlacedFootprint.Footprint.RowPitch = row_pitch;
 
+                    framework::swzc_diag_note_d3d12_copy("compositor copy @1601 region", dst.pResource, 0, 0,
+                                                         src.pResource, &box);
                     cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
                 }
 

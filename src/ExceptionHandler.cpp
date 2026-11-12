@@ -3,6 +3,7 @@
 #include <ShlObj.h>
 #include <TlHelp32.h>
 #include <Psapi.h>
+#include <d3d12.h>
 #include <algorithm>
 #include <atomic>
 #include <cwctype>
@@ -1187,7 +1188,7 @@ void framework::swzc_diag_init() {
     QueryPerformanceFrequency(&g_qpf);
     QueryPerformanceCounter(&g_qpc0);
 
-    const auto path = (Framework::get_persistent_dir() / "swzc_fix2.txt").wstring();
+    const auto path = (Framework::get_persistent_dir() / "swzc_diag3.txt").wstring();
     DeleteFileW(path.c_str());
     g_file = CreateFileW(path.c_str(), FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                          OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1203,7 +1204,7 @@ void framework::swzc_diag_init() {
 
     {
         auto l = begin_line();
-        l.s("[FIX2] uu3d-swzc-fix2 side log (diag2 logging kept), pid ").dec(GetCurrentProcessId())
+        l.s("[DIAG3] uu3d-swzc-diag3 side log (fix1+fix2 behaviour, diag2+diag3 logging), pid ").dec(GetCurrentProcessId())
             .s(". Times are seconds since this line.");
         write(l);
     }
@@ -1253,13 +1254,8 @@ void framework::swzc_diag_exec_begin(const void* engine, std::wstring_view comma
     if (no == 1) {
         dump_engine_object(engine);
 
-        auto l = begin_line();
-        l.s("[DIAG2] main log now flushes every line");
-        write(l);
-
-        // Keep the main log's last info lines on disk too: the 00053 log could
-        // only show lines up to the last error-level flush.
-        spdlog::flush_on(spdlog::level::info);
+        // diag3: the main log keeps its normal flush policy (diag1/2 flushed
+        // every line, which added disk work to every frame of the fix2 run).
     }
 
     if (const auto logger = spdlog::default_logger()) {
@@ -1345,5 +1341,129 @@ void framework::swzc_diag_note_copy(const SwzcCopyNote& n) {
         .s(" dst=").hex(n.dst_res).s(" ").dec(n.dst_w).s("x").dec(n.dst_h).s(" fmt ").dec(n.dst_fmt).s(" flags ")
         .hex(n.dst_flags).s(" arr ").dec(n.dst_depth).s(" mips ").dec(n.dst_mips).s(" layout ").dec(n.dst_layout)
         .s(" ms ").dec(n.dst_samples).s(".").dec(n.dst_quality);
+    write(l);
+}
+
+namespace {
+namespace swzc_diag {
+std::atomic<uint32_t> g_d3d_lines{0};
+
+void append_desc(Line& l, const D3D12_RESOURCE_DESC& d) {
+    l.s("dim ").dec((uint64_t)d.Dimension).s(" ").dec(d.Width).s("x").dec(d.Height).s(" arr ").dec(d.DepthOrArraySize)
+        .s(" mips ").dec(d.MipLevels).s(" fmt ").dec((uint64_t)d.Format).s(" flags ").hex((uint64_t)d.Flags)
+        .s(" ms ").dec(d.SampleDesc.Count).s(".").dec(d.SampleDesc.Quality).s(" layout ").dec((uint64_t)d.Layout);
+}
+
+uint64_t mix(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+uint64_t desc_hash(uint64_t h, const D3D12_RESOURCE_DESC& d) {
+    h = mix(h, (uint64_t)d.Dimension);
+    h = mix(h, d.Width);
+    h = mix(h, d.Height);
+    h = mix(h, d.DepthOrArraySize);
+    h = mix(h, d.MipLevels);
+    h = mix(h, (uint64_t)d.Format);
+    h = mix(h, (uint64_t)d.Flags);
+    h = mix(h, d.SampleDesc.Count);
+    return h;
+}
+} // namespace swzc_diag
+} // namespace
+
+void framework::swzc_diag_note_d3d12_copy(const char* site, void* dst, unsigned dst_x, unsigned dst_y, void* src,
+                                          const void* box_ptr) {
+    using namespace swzc_diag;
+
+    if (!swzc_diag_enabled() || site == nullptr || dst == nullptr || src == nullptr) {
+        return;
+    }
+
+    const auto dd = static_cast<ID3D12Resource*>(dst)->GetDesc();
+    const auto sd = static_cast<ID3D12Resource*>(src)->GetDesc();
+    const auto* box = static_cast<const D3D12_BOX*>(box_ptr);
+
+    const bool textures = dd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                          sd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER;
+    const bool fmt_diff = textures && dd.Format != sd.Format;
+    bool box_oob = false;
+    if (textures) {
+        const uint64_t bl = box ? box->left : 0, bt = box ? box->top : 0;
+        const uint64_t br = box ? box->right : sd.Width, bb = box ? box->bottom : sd.Height;
+        box_oob = br > sd.Width || bb > sd.Height || bl >= br || bt >= bb ||
+                  dst_x + (br - bl) > dd.Width || dst_y + (bb - bt) > dd.Height;
+        if (box == nullptr && dst_x == 0 && dst_y == 0) {
+            box_oob = box_oob || dd.Width != sd.Width || dd.Height != sd.Height;
+        }
+    }
+
+    uint64_t h = mix(0, (uint64_t)(uintptr_t)site);
+    h = desc_hash(h, dd);
+    h = desc_hash(h, sd);
+    if (box) {
+        h = mix(h, box->left);
+        h = mix(h, box->top);
+        h = mix(h, box->right);
+        h = mix(h, box->bottom);
+    }
+    h = mix(h, dst_x);
+    h = mix(h, dst_y);
+    const auto repeat = count_repeat(h);
+
+    if ((repeat > 1 && repeat % 1000 != 0) || g_d3d_lines.fetch_add(1) >= 2000) {
+        return;
+    }
+
+    auto l = begin_line();
+    l.s("[D3DCOPY] ").s(site).s(" repeat ").dec(repeat);
+    if (fmt_diff) {
+        l.s(" FMT_DIFF");
+    }
+    if (box_oob) {
+        l.s(" BOX_OOB");
+    }
+    l.s(" dst=").hex((uintptr_t)dst).s(" at ").dec(dst_x).s(",").dec(dst_y).s(" ");
+    append_desc(l, dd);
+    l.s(" | src=").hex((uintptr_t)src).s(" ");
+    append_desc(l, sd);
+    if (box) {
+        l.s(" | box ").dec(box->left).s(",").dec(box->top).s(",").dec(box->front).s(" -> ").dec(box->right).s(",")
+            .dec(box->bottom).s(",").dec(box->back);
+    } else {
+        l.s(" | box whole");
+    }
+    write(l);
+}
+
+void framework::swzc_diag_note_d3d12_resource(const char* site, void* resource) {
+    using namespace swzc_diag;
+
+    if (!swzc_diag_enabled() || site == nullptr) {
+        return;
+    }
+
+    D3D12_RESOURCE_DESC d{};
+    if (resource != nullptr) {
+        d = static_cast<ID3D12Resource*>(resource)->GetDesc();
+    }
+
+    uint64_t h = mix(0x51ull, (uint64_t)(uintptr_t)site);
+    h = mix(h, (uint64_t)(uintptr_t)resource);
+    h = desc_hash(h, d);
+    const auto repeat = count_repeat(h);
+
+    if ((repeat > 1 && repeat % 1000 != 0) || g_d3d_lines.fetch_add(1) >= 2000) {
+        return;
+    }
+
+    auto l = begin_line();
+    l.s("[D3DRES] ").s(site).s(" repeat ").dec(repeat).s(" res=").hex((uintptr_t)resource).s(" ");
+    if (resource != nullptr) {
+        append_desc(l, d);
+    } else {
+        l.s("<null>");
+    }
     write(l);
 }
