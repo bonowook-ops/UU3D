@@ -631,6 +631,272 @@ ID3D12Resource* D3D12Component::run_flat3d_framewarp(
     return otherFB.color.pTexture;
 }
 
+// SND diag5 (logging only): which GPU commands put the double-wide scene into
+// the redirected Slate UI target. Shared ID3D12 vtable slots are pointer-hooked
+// (originals saved first, chained like GameDepthCapture). Idle cost is one
+// atomic load per call; every ~20 s, for 3 presents, the commands that touch
+// the UI target or the scene render target are recorded in order per command
+// list and then logged. Installed only for StupidNeverDies.exe.
+namespace snd_trace {
+using PFN_CreateRTV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_OMSetRTs = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+using PFN_BeginRP = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS);
+using PFN_Barrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+using PFN_SetPSO = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using PFN_SetVP = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_VIEWPORT*);
+using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using PFN_DrawIdx = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+using PFN_ClearRTV = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE, const FLOAT[4], UINT, const D3D12_RECT*);
+using PFN_CopyRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*, UINT, UINT, UINT, const D3D12_TEXTURE_COPY_LOCATION*, const D3D12_BOX*);
+using PFN_CopyRes = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
+
+// Graphics command list vtable slots (base interfaces; same as GameDepthCapture).
+constexpr size_t kDraw = 12, kDrawIdx = 13, kCopyRegion = 16, kCopyRes = 17, kSetVP = 21, kSetPSO = 25,
+                 kBarrier = 26, kOMSetRTs = 46, kClearRTV = 48, kBeginRP = 68;
+constexpr size_t kDevCreateRTV = 20;
+
+std::atomic<void*> o_create_rtv{}, o_om{}, o_rp{}, o_barrier{}, o_pso{}, o_vp{}, o_draw{}, o_draw_idx{},
+    o_clear{}, o_copy_region{}, o_copy_res{};
+std::vector<std::unique_ptr<PointerHook>> g_hooks{};
+bool g_install_attempted{};
+
+std::atomic_bool g_active{};
+std::atomic<ID3D12Resource*> g_ui{}, g_dw{};
+
+struct ListState {
+    ID3D12Resource* rt0{};
+    void* pso{};
+    float vp_w{}, vp_h{};
+    std::vector<std::string> events{};
+};
+std::mutex g_mx{};
+std::unordered_map<uint64_t, ID3D12Resource*> g_rtv{}; // RTV CPU handle -> resource (always kept)
+std::unordered_map<void*, ListState> g_lists{};        // only while tracing
+bool g_dw_readable{};                                  // last seen dw transition targets a shader-read state
+uint32_t g_trace_index{};
+uint32_t g_events_total{};
+constexpr uint32_t kMaxEventsPerTrace = 600;
+
+const char* kind(ID3D12Resource* r) {
+    if (r == nullptr) { return "null"; }
+    if (r == g_ui.load(std::memory_order_relaxed)) { return "UI"; }
+    if (r == g_dw.load(std::memory_order_relaxed)) { return "SCENE"; }
+    return "other";
+}
+
+std::string describe(ID3D12Resource* r) {
+    if (r == nullptr) { return "null"; }
+    const auto d = r->GetDesc();
+    return fmt::format("{}({}x{} fmt={})", kind(r), d.Width, d.Height, (uint32_t)d.Format);
+}
+
+// Caller holds g_mx.
+void add_event(void* list, std::string text) {
+    if (g_events_total >= kMaxEventsPerTrace) { return; }
+    ++g_events_total;
+    g_lists[list].events.push_back(std::move(text));
+}
+
+void STDMETHODCALLTYPE create_rtv(ID3D12Device* self, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    reinterpret_cast<PFN_CreateRTV>(o_create_rtv.load(std::memory_order_relaxed))(self, r, d, h);
+    std::scoped_lock _{g_mx};
+    if (g_rtv.size() > 200000) { g_rtv.clear(); }
+    g_rtv[h.ptr] = r;
+}
+
+ID3D12Resource* rtv_resource(uint64_t ptr) {
+    const auto it = g_rtv.find(ptr);
+    return it != g_rtv.end() ? it->second : nullptr;
+}
+
+void bind_rt(ID3D12GraphicsCommandList* list, ID3D12Resource* rt, const char* via) {
+    auto& st = g_lists[list];
+    const bool interesting = rt != nullptr && (rt == g_ui.load() || rt == g_dw.load());
+    const bool was_interesting = st.rt0 != nullptr && (st.rt0 == g_ui.load() || st.rt0 == g_dw.load());
+    st.rt0 = rt;
+    if (interesting || was_interesting) {
+        add_event(list, fmt::format("{} RT0={}", via, describe(rt)));
+    }
+}
+
+void STDMETHODCALLTYPE om_set(ID3D12GraphicsCommandList* self, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    if (g_active.load(std::memory_order_relaxed)) {
+        std::scoped_lock _{g_mx};
+        bind_rt(self, n > 0 && rts != nullptr ? rtv_resource(rts[0].ptr) : nullptr, "OMSetRenderTargets");
+    }
+    reinterpret_cast<PFN_OMSetRTs>(o_om.load(std::memory_order_relaxed))(self, n, rts, single, ds);
+}
+
+void STDMETHODCALLTYPE begin_rp(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rts,
+                                const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds, D3D12_RENDER_PASS_FLAGS f) {
+    if (g_active.load(std::memory_order_relaxed)) {
+        std::scoped_lock _{g_mx};
+        bind_rt(self, n > 0 && rts != nullptr ? rtv_resource(rts[0].cpuDescriptor.ptr) : nullptr, "BeginRenderPass");
+    }
+    reinterpret_cast<PFN_BeginRP>(o_rp.load(std::memory_order_relaxed))(self, n, rts, ds, f);
+}
+
+void STDMETHODCALLTYPE barrier(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RESOURCE_BARRIER* b) {
+    if (g_active.load(std::memory_order_relaxed) && b != nullptr) {
+        std::scoped_lock _{g_mx};
+        for (UINT i = 0; i < n; ++i) {
+            if (b[i].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) { continue; }
+            auto* r = b[i].Transition.pResource;
+            if (r == nullptr || (r != g_ui.load() && r != g_dw.load())) { continue; }
+            if (r == g_dw.load()) {
+                g_dw_readable = (b[i].Transition.StateAfter &
+                    (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) != 0;
+            }
+            add_event(self, fmt::format("Barrier {} 0x{:x} -> 0x{:x} sub={}", kind(r),
+                (uint32_t)b[i].Transition.StateBefore, (uint32_t)b[i].Transition.StateAfter, b[i].Transition.Subresource));
+        }
+    }
+    reinterpret_cast<PFN_Barrier>(o_barrier.load(std::memory_order_relaxed))(self, n, b);
+}
+
+void STDMETHODCALLTYPE set_pso(ID3D12GraphicsCommandList* self, ID3D12PipelineState* p) {
+    if (g_active.load(std::memory_order_relaxed)) {
+        std::scoped_lock _{g_mx};
+        g_lists[self].pso = p;
+    }
+    reinterpret_cast<PFN_SetPSO>(o_pso.load(std::memory_order_relaxed))(self, p);
+}
+
+void STDMETHODCALLTYPE set_vp(ID3D12GraphicsCommandList* self, UINT n, const D3D12_VIEWPORT* v) {
+    if (g_active.load(std::memory_order_relaxed) && n > 0 && v != nullptr) {
+        std::scoped_lock _{g_mx};
+        auto& st = g_lists[self];
+        st.vp_w = v[0].Width;
+        st.vp_h = v[0].Height;
+    }
+    reinterpret_cast<PFN_SetVP>(o_vp.load(std::memory_order_relaxed))(self, n, v);
+}
+
+void note_draw(ID3D12GraphicsCommandList* self, const char* what, UINT count, UINT instances) {
+    std::scoped_lock _{g_mx};
+    auto& st = g_lists[self];
+    if (st.rt0 == nullptr || st.rt0 != g_ui.load()) { return; }
+    add_event(self, fmt::format("{} count={} inst={} pso={:x} viewport={:.0f}x{:.0f} scene_readable={}", what, count, instances,
+        reinterpret_cast<uintptr_t>(st.pso), st.vp_w, st.vp_h, g_dw_readable));
+}
+
+void STDMETHODCALLTYPE draw(ID3D12GraphicsCommandList* self, UINT v, UINT i, UINT sv, UINT si) {
+    if (g_active.load(std::memory_order_relaxed)) { note_draw(self, "DrawInstanced", v, i); }
+    reinterpret_cast<PFN_Draw>(o_draw.load(std::memory_order_relaxed))(self, v, i, sv, si);
+}
+
+void STDMETHODCALLTYPE draw_idx(ID3D12GraphicsCommandList* self, UINT c, UINT i, UINT si, INT bv, UINT sin) {
+    if (g_active.load(std::memory_order_relaxed)) { note_draw(self, "DrawIndexedInstanced", c, i); }
+    reinterpret_cast<PFN_DrawIdx>(o_draw_idx.load(std::memory_order_relaxed))(self, c, i, si, bv, sin);
+}
+
+void STDMETHODCALLTYPE clear_rtv(ID3D12GraphicsCommandList* self, D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n, const D3D12_RECT* r) {
+    if (g_active.load(std::memory_order_relaxed)) {
+        std::scoped_lock _{g_mx};
+        auto* res = rtv_resource(h.ptr);
+        if (res != nullptr && (res == g_ui.load() || res == g_dw.load())) {
+            add_event(self, fmt::format("ClearRenderTargetView {} color=({:.2f},{:.2f},{:.2f},{:.2f}) rects={}", kind(res),
+                c != nullptr ? c[0] : 0.f, c != nullptr ? c[1] : 0.f, c != nullptr ? c[2] : 0.f, c != nullptr ? c[3] : 0.f, n));
+        }
+    }
+    reinterpret_cast<PFN_ClearRTV>(o_clear.load(std::memory_order_relaxed))(self, h, c, n, r);
+}
+
+void STDMETHODCALLTYPE copy_region(ID3D12GraphicsCommandList* self, const D3D12_TEXTURE_COPY_LOCATION* dst, UINT x, UINT y, UINT z,
+                                   const D3D12_TEXTURE_COPY_LOCATION* src, const D3D12_BOX* box) {
+    if (g_active.load(std::memory_order_relaxed) && dst != nullptr && src != nullptr &&
+        (dst->pResource == g_ui.load() || dst->pResource == g_dw.load())) {
+        std::scoped_lock _{g_mx};
+        add_event(self, fmt::format("CopyTextureRegion dst={} src={} at={},{}", kind(dst->pResource), describe(src->pResource), x, y));
+    }
+    reinterpret_cast<PFN_CopyRegion>(o_copy_region.load(std::memory_order_relaxed))(self, dst, x, y, z, src, box);
+}
+
+void STDMETHODCALLTYPE copy_res(ID3D12GraphicsCommandList* self, ID3D12Resource* dst, ID3D12Resource* src) {
+    if (g_active.load(std::memory_order_relaxed) && (dst == g_ui.load() || dst == g_dw.load())) {
+        std::scoped_lock _{g_mx};
+        add_event(self, fmt::format("CopyResource dst={} src={}", kind(dst), describe(src)));
+    }
+    reinterpret_cast<PFN_CopyRes>(o_copy_res.load(std::memory_order_relaxed))(self, dst, src);
+}
+
+void install(ID3D12Device* device) {
+    if (g_install_attempted || device == nullptr) { return; }
+    g_install_attempted = true;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list{};
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+        spdlog::error("[SND diag5] could not create a probe command list; draw trace not installed");
+        return;
+    }
+    list->Close();
+    void** lv = *reinterpret_cast<void***>(list.Get());
+    void** dv = *reinterpret_cast<void***>(device);
+    const auto hook = [](void** slot, std::atomic<void*>& orig, void* dest) {
+        orig.store(*slot, std::memory_order_relaxed);
+        g_hooks.push_back(std::make_unique<PointerHook>(slot, dest));
+    };
+    hook(&dv[kDevCreateRTV], o_create_rtv, reinterpret_cast<void*>(&create_rtv));
+    hook(&lv[kOMSetRTs], o_om, reinterpret_cast<void*>(&om_set));
+    hook(&lv[kBarrier], o_barrier, reinterpret_cast<void*>(&barrier));
+    hook(&lv[kSetPSO], o_pso, reinterpret_cast<void*>(&set_pso));
+    hook(&lv[kSetVP], o_vp, reinterpret_cast<void*>(&set_vp));
+    hook(&lv[kDraw], o_draw, reinterpret_cast<void*>(&draw));
+    hook(&lv[kDrawIdx], o_draw_idx, reinterpret_cast<void*>(&draw_idx));
+    hook(&lv[kClearRTV], o_clear, reinterpret_cast<void*>(&clear_rtv));
+    hook(&lv[kCopyRegion], o_copy_region, reinterpret_cast<void*>(&copy_region));
+    hook(&lv[kCopyRes], o_copy_res, reinterpret_cast<void*>(&copy_res));
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list4{};
+    if (SUCCEEDED(list.As(&list4)) && list4 != nullptr) {
+        hook(&lv[kBeginRP], o_rp, reinterpret_cast<void*>(&begin_rp));
+    }
+    spdlog::info("[SND diag5] draw trace hooks installed ({} slots); RTVs created before this point are unknown "
+                 "until the engine recreates them", g_hooks.size());
+}
+
+// Called once per Flat3D present.
+void on_present(ID3D12Device* device, ID3D12Resource* scene, ID3D12Resource* ui) {
+    install(device);
+    if (g_hooks.empty()) { return; }
+    static uint64_t s_presents = 0;
+    static int s_remaining = 0;
+    ++s_presents;
+    if (g_active.load()) {
+        if (--s_remaining > 0) { return; }
+        g_active.store(false);
+        std::scoped_lock _{g_mx};
+        spdlog::info("[SND diag5][trace#{}] end: {} command lists touched UI/SCENE, {} events{} (RTVs known: {})",
+            g_trace_index, g_lists.size(), g_events_total, g_events_total >= kMaxEventsPerTrace ? " (capped)" : "", g_rtv.size());
+        for (const auto& [l, st] : g_lists) {
+            if (st.events.empty()) { continue; }
+            spdlog::info("[SND diag5][trace#{}] list={:x}", g_trace_index, reinterpret_cast<uintptr_t>(l));
+            for (size_t i = 0; i < st.events.size(); ++i) {
+                spdlog::info("[SND diag5][trace#{}]   {:3} {}", g_trace_index, i, st.events[i]);
+            }
+        }
+        g_lists.clear();
+        return;
+    }
+    // First trace ~10 s in, then every ~20 s, at most 12 traces.
+    if (scene == nullptr || ui == nullptr || g_trace_index >= 12 || s_presents < 600 || (s_presents % 1200) != 600) { return; }
+    std::scoped_lock _{g_mx};
+    g_ui.store(ui);
+    g_dw.store(scene);
+    g_lists.clear();
+    g_events_total = 0;
+    g_dw_readable = false;
+    ++g_trace_index;
+    const auto sd = scene->GetDesc();
+    const auto ud = ui->GetDesc();
+    spdlog::info("[SND diag5][trace#{}] begin at present {}: SCENE={:x} ({}x{}) UI={:x} ({}x{}), 3 presents",
+        g_trace_index, s_presents, reinterpret_cast<uintptr_t>(scene), sd.Width, sd.Height,
+        reinterpret_cast<uintptr_t>(ui), ud.Width, ud.Height);
+    s_remaining = 3;
+    g_active.store(true);
+}
+} // namespace snd_trace
+
 vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     auto& hook = g_framework->get_d3d12_hook();
 
@@ -638,6 +904,12 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
 
     auto device = hook->get_device();
     auto swapchain = hook->get_swap_chain();
+
+    // SND diag5: install the draw-trace hooks at the first Flat3D present, before
+    // the engine creates its UI/scene targets, so their RTVs are seen.
+    if (flat3d::snd_diag::enabled()) {
+        snd_trace::install(device);
+    }
 
     // DSV-observer depth: snapshot the live scene depth at the API level (no
     // engine hook, sees depth allocated at any time). Only the flat3d on_frame
@@ -996,6 +1268,8 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
             spdlog::info("[SND diag1][Composite] frame={} {}", vr->m_render_frame_count, key);
         }
         s_last = key;
+
+        snd_trace::on_present(device, double_wide.Get(), ui_tex);
     }
 
     const bool composited = m_flat3d_compositor.composite(double_wide.Get(), second_eye_src, ui_tex, menu_tex,
