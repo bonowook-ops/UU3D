@@ -14,9 +14,232 @@
 #include "../GameDepthCapture.hpp"
 
 #include "../D3D12Component.hpp"
+#include "../StupidNeverDiesUI.hpp"
+#include "StupidNeverDiesViewportSkip.hpp"
 
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
+
+// See StupidNeverDiesViewportSkip.hpp. Shared ID3D12 vtable slots are
+// pointer-hooked with the originals saved first (chained the same way as
+// GameDepthCapture). Per-call cost outside the routed UI pass is a
+// thread-local compare.
+namespace vrmod::flat3d::snd_viewport_skip {
+namespace {
+using PFN_CreateRTV = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+using PFN_OMSetRTs = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL, const D3D12_CPU_DESCRIPTOR_HANDLE*);
+using PFN_BeginRP = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RENDER_PASS_RENDER_TARGET_DESC*, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC*, D3D12_RENDER_PASS_FLAGS);
+using PFN_SetPSO = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using PFN_Draw = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using PFN_DrawIdx = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+
+// Base-interface vtable slots (same indices GameDepthCapture uses).
+constexpr size_t kDraw = 12, kDrawIdx = 13, kSetPSO = 25, kOMSetRTs = 46, kBeginRP = 68;
+constexpr size_t kDevCreateRTV = 20;
+
+std::atomic<void*> o_create_rtv{}, o_om{}, o_rp{}, o_pso{}, o_draw{}, o_draw_idx{};
+std::vector<std::unique_ptr<PointerHook>> g_hooks{};
+bool g_install_attempted{};
+
+std::atomic<ID3D12Resource*> g_ui{};
+
+// RTV CPU handle -> resource. RTV creation is rare, so a locked map is fine.
+std::mutex g_rtv_mutex{};
+std::unordered_map<uint64_t, ID3D12Resource*> g_rtv{};
+
+// Pipeline states seen on any draw into the UI target other than a skipped one.
+constexpr size_t kMaxUiPsos = 128;
+std::array<std::atomic<void*>, kMaxUiPsos> g_ui_psos{};
+
+std::atomic<uint64_t> g_skipped{};
+std::atomic<void*> g_last_skipped_pso{};
+std::atomic_bool g_logged_first_skip{};
+
+// D3D12 command lists are recorded by one thread at a time.
+struct ThreadState {
+    ID3D12GraphicsCommandList* bound_list{};
+    bool ui_bound{};
+    bool first_pending{};
+    ID3D12GraphicsCommandList* pso_list{};
+    ID3D12PipelineState* pso{};
+};
+thread_local ThreadState t_state{};
+
+bool known_ui_pso(void* pso) {
+    for (auto& slot : g_ui_psos) {
+        void* v = slot.load(std::memory_order_relaxed);
+        if (v == pso) { return true; }
+        if (v == nullptr) { return false; }
+    }
+    return false;
+}
+
+void learn_ui_pso(void* pso) {
+    if (pso == nullptr || known_ui_pso(pso)) { return; }
+    for (auto& slot : g_ui_psos) {
+        void* expected = nullptr;
+        if (slot.compare_exchange_strong(expected, pso, std::memory_order_relaxed) || expected == pso) {
+            return;
+        }
+    }
+}
+
+// RTV handles that currently view the UI target, refreshed once per present
+// from g_rtv, so binding checks never take the lock.
+constexpr size_t kMaxUiRtvs = 8;
+std::array<std::atomic<uint64_t>, kMaxUiRtvs> g_ui_rtvs{};
+
+bool is_ui_rtv(uint64_t ptr) {
+    if (ptr == 0) { return false; }
+    for (auto& h : g_ui_rtvs) {
+        if (h.load(std::memory_order_relaxed) == ptr) { return true; }
+    }
+    return false;
+}
+
+void bind(ID3D12GraphicsCommandList* list, uint64_t rtv0) {
+    const bool is_ui = g_ui.load(std::memory_order_relaxed) != nullptr && is_ui_rtv(rtv0);
+    t_state.bound_list = list;
+    t_state.ui_bound = is_ui;
+    t_state.first_pending = is_ui;
+}
+
+ID3D12PipelineState* current_pso(ID3D12GraphicsCommandList* list) {
+    return t_state.pso_list == list ? t_state.pso : nullptr;
+}
+
+bool ui_draw(ID3D12GraphicsCommandList* list) {
+    return t_state.bound_list == list && t_state.ui_bound;
+}
+
+void STDMETHODCALLTYPE create_rtv(ID3D12Device* self, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    reinterpret_cast<PFN_CreateRTV>(o_create_rtv.load(std::memory_order_relaxed))(self, r, d, h);
+    std::scoped_lock _{g_rtv_mutex};
+    if (g_rtv.size() >= 65536) { g_rtv.clear(); }
+    g_rtv[h.ptr] = r;
+}
+
+void STDMETHODCALLTYPE om_set(ID3D12GraphicsCommandList* self, UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* rts, BOOL single, const D3D12_CPU_DESCRIPTOR_HANDLE* ds) {
+    bind(self, n > 0 && rts != nullptr ? rts[0].ptr : 0);
+    reinterpret_cast<PFN_OMSetRTs>(o_om.load(std::memory_order_relaxed))(self, n, rts, single, ds);
+}
+
+void STDMETHODCALLTYPE begin_rp(ID3D12GraphicsCommandList* self, UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rts,
+                                const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* ds, D3D12_RENDER_PASS_FLAGS f) {
+    bind(self, n > 0 && rts != nullptr ? rts[0].cpuDescriptor.ptr : 0);
+    reinterpret_cast<PFN_BeginRP>(o_rp.load(std::memory_order_relaxed))(self, n, rts, ds, f);
+}
+
+void STDMETHODCALLTYPE set_pso(ID3D12GraphicsCommandList* self, ID3D12PipelineState* p) {
+    t_state.pso_list = self;
+    t_state.pso = p;
+    reinterpret_cast<PFN_SetPSO>(o_pso.load(std::memory_order_relaxed))(self, p);
+}
+
+void STDMETHODCALLTYPE draw(ID3D12GraphicsCommandList* self, UINT v, UINT i, UINT sv, UINT si) {
+    if (ui_draw(self)) {
+        t_state.first_pending = false;
+        learn_ui_pso(current_pso(self));
+    }
+    reinterpret_cast<PFN_Draw>(o_draw.load(std::memory_order_relaxed))(self, v, i, sv, si);
+}
+
+void STDMETHODCALLTYPE draw_idx(ID3D12GraphicsCommandList* self, UINT c, UINT i, UINT si, INT bv, UINT sin) {
+    if (ui_draw(self)) {
+        auto* const pso = current_pso(self);
+        const bool first = t_state.first_pending;
+        t_state.first_pending = false;
+        if (first && c == 6 && i == 1 && pso != nullptr && !known_ui_pso(pso)) {
+            // The game-viewport quad: leave the UI target transparent here.
+            g_skipped.fetch_add(1, std::memory_order_relaxed);
+            g_last_skipped_pso.store(pso, std::memory_order_relaxed);
+            return;
+        }
+        learn_ui_pso(pso);
+    }
+    reinterpret_cast<PFN_DrawIdx>(o_draw_idx.load(std::memory_order_relaxed))(self, c, i, si, bv, sin);
+}
+} // namespace
+
+bool enabled() {
+    static const bool title = [] {
+        wchar_t buffer[MAX_PATH * 2]{};
+        const auto length = GetModuleFileNameW(nullptr, buffer, (DWORD)std::size(buffer));
+        return length != 0 && length < std::size(buffer) &&
+            uevr::stupid_never_dies_ui::target(std::wstring_view{buffer, length}, true);
+    }();
+    return title;
+}
+
+void install(ID3D12Device* device) {
+    if (g_install_attempted || device == nullptr || !enabled()) { return; }
+    g_install_attempted = true;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc{};
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list{};
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr, IID_PPV_ARGS(&list)))) {
+        spdlog::error("[StupidNeverDies][ViewportSkip] could not create a probe command list; not installed");
+        return;
+    }
+    list->Close();
+    void** lv = *reinterpret_cast<void***>(list.Get());
+    void** dv = *reinterpret_cast<void***>(device);
+    const auto hook = [](void** slot, std::atomic<void*>& orig, void* dest) {
+        orig.store(*slot, std::memory_order_relaxed);
+        g_hooks.push_back(std::make_unique<PointerHook>(slot, dest));
+    };
+    hook(&dv[kDevCreateRTV], o_create_rtv, reinterpret_cast<void*>(&create_rtv));
+    hook(&lv[kOMSetRTs], o_om, reinterpret_cast<void*>(&om_set));
+    hook(&lv[kSetPSO], o_pso, reinterpret_cast<void*>(&set_pso));
+    hook(&lv[kDraw], o_draw, reinterpret_cast<void*>(&draw));
+    hook(&lv[kDrawIdx], o_draw_idx, reinterpret_cast<void*>(&draw_idx));
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> list4{};
+    if (SUCCEEDED(list.As(&list4)) && list4 != nullptr) {
+        hook(&lv[kBeginRP], o_rp, reinterpret_cast<void*>(&begin_rp));
+    }
+    spdlog::info("[StupidNeverDies][ViewportSkip] installed ({} D3D12 hooks)", g_hooks.size());
+}
+
+void on_present(ID3D12Resource* ui_target) {
+    if (g_hooks.empty()) { return; }
+    g_ui.store(ui_target, std::memory_order_relaxed);
+    {
+        size_t n = 0;
+        std::scoped_lock _{g_rtv_mutex};
+        if (ui_target != nullptr) {
+            for (const auto& [handle, resource] : g_rtv) {
+                if (resource == ui_target && n < kMaxUiRtvs) {
+                    g_ui_rtvs[n++].store(handle, std::memory_order_relaxed);
+                }
+            }
+        }
+        for (; n < kMaxUiRtvs; ++n) {
+            g_ui_rtvs[n].store(0, std::memory_order_relaxed);
+        }
+    }
+
+    const auto skipped = g_skipped.load(std::memory_order_relaxed);
+    if (skipped != 0 && !g_logged_first_skip.exchange(true)) {
+        spdlog::info("[StupidNeverDies][ViewportSkip] skipping the game-viewport quad in the routed Slate UI (pso={:x})",
+            reinterpret_cast<uintptr_t>(g_last_skipped_pso.load(std::memory_order_relaxed)));
+    }
+    static uint64_t s_last_tick = 0;
+    static uint64_t s_last_skipped = 0;
+    const auto now = GetTickCount64();
+    if (now - s_last_tick >= 10000) {
+        size_t learned = 0;
+        for (auto& slot : g_ui_psos) {
+            if (slot.load(std::memory_order_relaxed) != nullptr) { ++learned; }
+        }
+        if (s_last_tick != 0) {
+            spdlog::info("[StupidNeverDies][ViewportSkip] last 10 s: skipped {} viewport quads, {} UI pipeline states known",
+                skipped - s_last_skipped, learned);
+        }
+        s_last_tick = now;
+        s_last_skipped = skipped;
+    }
+}
+} // namespace vrmod::flat3d::snd_viewport_skip
 
 namespace vrmod {
 // AFW (Asynchronous Frame Warp) for Flat3D. Mirrors the OpenXR warp block in
@@ -638,6 +861,10 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     auto device = hook->get_device();
     auto swapchain = hook->get_swap_chain();
 
+    // Stupid Never Dies: install before the engine creates its UI/scene
+    // targets so their RTVs are known (no-op for every other game).
+    flat3d::snd_viewport_skip::install(device);
+
     // DSV-observer depth: snapshot the live scene depth at the API level (no
     // engine hook, sees depth allocated at any time). Only the flat3d on_frame
     // path registers this observer, so there is no contention over the slot.
@@ -973,6 +1200,11 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     if (vr->get_flat3d_runtime()->screenshot_requested.exchange(false)) {
         m_flat3d_compositor.begin_screenshot();
     }
+
+    // Stupid Never Dies: tell the viewport-quad skip which texture is the
+    // routed Slate UI target (no-op for every other game).
+    flat3d::snd_viewport_skip::on_present(
+        ui_target != nullptr ? (ID3D12Resource*)ui_target->get_native_resource() : nullptr);
 
     const bool composited = m_flat3d_compositor.composite(double_wide.Get(), second_eye_src, ui_tex, menu_tex,
                                        real_backbuffer.Get(), (uint32_t)bb_desc.Width, bb_desc.Height, params,
