@@ -2664,6 +2664,46 @@ bool sw_zero_company_ue56_is_current_game() {
     return result;
 }
 
+// Flat3D Native Render + Upscale (full side-by-side output such as 3840x1080
+// glasses): the engine is told its window is half the output width, so Slate
+// lays the UI out at 1920 wide, but it still rasterizes across the full-width
+// output (3840). A dedicated UI target of the perceived 1920 width therefore
+// receives the whole UI squeezed into its left half. Keep the dedicated UI
+// target at the full output width so the UI lands unsqueezed in the top-left
+// region that the Flat3D compositor crops (ui_topleft_crop). Every other
+// output, and every other game, keeps the requested extent.
+uint32_t sw_zero_company_flat3d_ui_width(uint32_t width, uint32_t height) {
+    if (!sw_zero_company_ue56_is_current_game() || width == 0 || height == 0) {
+        return width;
+    }
+
+    auto& vr = VR::get();
+    if (vr == nullptr || !vr->is_using_flat3d() || !vr->flat3d_is_full_sbs()) {
+        return width;
+    }
+
+    if (g_framework == nullptr) {
+        return width;
+    }
+
+    const auto& d3d12 = g_framework->get_d3d12_hook();
+    if (d3d12 == nullptr) {
+        return width;
+    }
+
+    const uint32_t output_width = d3d12->get_display_width();
+    const uint32_t output_height = d3d12->get_display_height();
+    if (output_height != height || output_width <= width) {
+        return width;
+    }
+
+    SPDLOG_INFO_ONCE(
+        "[SWZeroCompany][UE5.6][Flat3D] Full side-by-side output: dedicated UI target widened from {}x{} to the "
+        "{}x{} output so the half-width Slate layout is not squeezed",
+        width, height, output_width, output_height);
+    return output_width;
+}
+
 bool bodycam_ue554_is_current_game() {
     static const bool result = []() {
         const auto executable = utility::get_executable();
@@ -42817,6 +42857,8 @@ void VRRenderTargetManager_Base::request_dedicated_ui_target(uint32_t width, uin
     if (!supports_dedicated_ui_target_for_current_game() || width == 0 || height == 0) {
         return;
     }
+
+    width = sw_zero_company_flat3d_ui_width(width, height);
 
     if (ue58_ui_initialization_enabled.load(std::memory_order_acquire)) {
         ue58_ui_initialization.cancel_if(
