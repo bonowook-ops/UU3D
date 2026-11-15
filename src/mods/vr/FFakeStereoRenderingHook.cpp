@@ -38608,6 +38608,81 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         const bool valid_extent = width > 0 && width <= 16384 && height > 0 && height <= 16384;
         const auto vr = VR::get();
         auto* const rtm = g_hook->get_render_target_manager();
+
+        // eday-diag1 (observation only, no behavior change): what Slate itself
+        // is told to draw with - the scene view rect, the UI scale, and the raw
+        // FViewportInfo (holds Slate's projection matrix and its own
+        // width/height). Logged on change, at most once per second.
+        {
+            constexpr size_t dump_size = 0x140;
+            static uint8_t last_dump[dump_size]{};
+            static bool have_dump = false;
+            static UE55FIntRect last_rect{};
+            static float last_scale = -1.0f;
+            static void* last_viewport_info = nullptr;
+            static void* last_window = nullptr;
+            static uint32_t dump_count = 0;
+            static std::chrono::steady_clock::time_point last_dump_time{};
+
+            uint8_t dump[dump_size]{};
+            const auto viewport_info_address = reinterpret_cast<uintptr_t>(ue55_inputs_full.viewport_info);
+            const bool dump_ok = is_readable_process_range(viewport_info_address, dump_size);
+            if (dump_ok) {
+                memcpy(dump, reinterpret_cast<const void*>(viewport_info_address), dump_size);
+            }
+
+            const bool changed =
+                memcmp(&last_rect, &ue55_inputs_full.scene_view_rect, sizeof(last_rect)) != 0 ||
+                last_scale != ue55_inputs_full.viewport_scale_ui ||
+                last_viewport_info != ue55_inputs_full.viewport_info ||
+                last_window != ue55_inputs_full.window ||
+                (dump_ok && (!have_dump || memcmp(last_dump, dump, dump_size) != 0));
+            const auto now = std::chrono::steady_clock::now();
+
+            if (changed && dump_count < 300 && now - last_dump_time >= std::chrono::seconds(1)) {
+                ++dump_count;
+                last_dump_time = now;
+                last_rect = ue55_inputs_full.scene_view_rect;
+                last_scale = ue55_inputs_full.viewport_scale_ui;
+                last_viewport_info = ue55_inputs_full.viewport_info;
+                last_window = ue55_inputs_full.window;
+                if (dump_ok) {
+                    memcpy(last_dump, dump, dump_size);
+                    have_dump = true;
+                }
+
+                std::string words{};
+                if (dump_ok) {
+                    for (size_t i = 0; i + sizeof(uint32_t) <= dump_size; i += sizeof(uint32_t)) {
+                        uint32_t word{};
+                        memcpy(&word, dump + i, sizeof(word));
+                        words += fmt::format("{:08x} ", word);
+                    }
+                } else {
+                    words = "unreadable";
+                }
+
+                SPDLOG_INFO(
+                    "[EDAY-DIAG][Slate] #{} window={:x} viewport_info={:x} scene_view_rect=({},{})-({},{}) [{}x{}] "
+                    "viewport_scale_ui={} cursor=({},{}) rtm_dedicated_ui=[{}x{}]",
+                    dump_count,
+                    reinterpret_cast<uintptr_t>(ue55_inputs_full.window),
+                    viewport_info_address,
+                    ue55_inputs_full.scene_view_rect.min.x,
+                    ue55_inputs_full.scene_view_rect.min.y,
+                    ue55_inputs_full.scene_view_rect.max.x,
+                    ue55_inputs_full.scene_view_rect.max.y,
+                    width,
+                    height,
+                    ue55_inputs_full.viewport_scale_ui,
+                    ue55_inputs_full.cursor_position.x,
+                    ue55_inputs_full.cursor_position.y,
+                    rtm != nullptr ? rtm->get_dedicated_ui_width() : 0,
+                    rtm != nullptr ? rtm->get_dedicated_ui_height() : 0);
+                SPDLOG_INFO("[EDAY-DIAG][Slate] #{} FViewportInfo raw u32[0x{:x}]: {}", dump_count, dump_size, words);
+            }
+        }
+
         if (vr != nullptr && vr->is_hmd_active() && !vr->is_stereo_emulation_enabled() &&
             !vr->is_extreme_compatibility_mode_enabled() && rtm != nullptr && valid_extent)
         {

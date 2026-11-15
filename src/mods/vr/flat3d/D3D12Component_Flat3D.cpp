@@ -16,6 +16,7 @@
 #include "../D3D12Component.hpp"
 #include "../FFakeStereoRenderingHook.hpp"
 
+#include <array>
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler") // runtime shader compilation (D3DCompile)
 
@@ -855,6 +856,40 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
             // crop (full-SbS goes through the top-left branch above).
             vrmod::flat3d::compute_ui_aspect_crop(
                 0, ui_aspect, scene_aspect, params.ui_crop_x, params.ui_crop_y);
+        }
+
+        // eday-diag1 (observation only, no behavior change): every size the UI
+        // composite depends on, logged whenever any of them changes.
+        {
+            const auto& d3d12_hook = g_framework->get_d3d12_hook();
+            const uint32_t believed_w = d3d12_hook != nullptr ? d3d12_hook->get_engine_believed_width() : 0;
+            const uint32_t believed_h = d3d12_hook != nullptr ? d3d12_hook->get_engine_believed_height() : 0;
+            const uint32_t forced_w = d3d12_hook != nullptr ? d3d12_hook->get_forced_resize_width() : 0;
+            const uint32_t forced_h = d3d12_hook != nullptr ? d3d12_hook->get_forced_resize_height() : 0;
+            const uint32_t requested_w = d3d12_hook != nullptr ? d3d12_hook->get_game_requested_width() : 0;
+            const uint32_t requested_h = d3d12_hook != nullptr ? d3d12_hook->get_game_requested_height() : 0;
+
+            const std::array<uint64_t, 20> now{
+                bb_desc.Width, bb_desc.Height, dw_desc.Width, dw_desc.Height, eye_w, eye_h, ui_w, ui_h,
+                believed_w, believed_h, forced_w, forced_h, requested_w, requested_h,
+                (uint64_t)vr->get_hmd_width(), (uint64_t)vr->get_hmd_height(),
+                (uint64_t)(params.ui_topleft_crop ? 1 : 0), (uint64_t)(ui_tex != nullptr ? 1 : 0),
+                (uint64_t)(params.ui_crop_x * 10000.0f), (uint64_t)(params.ui_crop_y * 10000.0f)};
+            static std::array<uint64_t, 20> last{};
+            static uint32_t count = 0;
+
+            if (now != last && count < 300) {
+                last = now;
+                ++count;
+                spdlog::info(
+                    "[EDAY-DIAG][Composite] #{} backbuffer={}x{} scene_target={}x{} eye={}x{} ui_target={}x{} "
+                    "ui_used_this_frame={} engine_believed={}x{} forced={}x{} game_requested={}x{} hmd={}x{} mode={} "
+                    "eye_slice={}x{} topleft_crop={} ui_crop=({}, {})",
+                    count, bb_desc.Width, bb_desc.Height, dw_desc.Width, dw_desc.Height, eye_w, eye_h, ui_w, ui_h,
+                    ui_tex != nullptr, believed_w, believed_h, forced_w, forced_h, requested_w, requested_h,
+                    vr->get_hmd_width(), vr->get_hmd_height(), (int)params.mode, eye_slice_w, eye_slice_h,
+                    params.ui_topleft_crop, params.ui_crop_x, params.ui_crop_y);
+            }
         }
     }
 
