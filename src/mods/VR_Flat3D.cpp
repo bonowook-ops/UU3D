@@ -206,7 +206,19 @@ static bool flat3d_should_spoof(HWND wnd) {
 BOOL WINAPI flat3d_spoofed_get_client_rect(HWND wnd, LPRECT rect) {
     const BOOL ok = g_clientrect_hook.unsafe_call<BOOL>(wnd, rect);
     if (ok && flat3d_should_spoof(wnd)) {
+        const LONG real_w = rect->right - rect->left;
+        const LONG real_h = rect->bottom - rect->top;
         flat3d_halve_rect_width(rect);
+
+        // eday-diag1 (observation only): the client size the game is told,
+        // logged whenever the real size changes.
+        static std::atomic<uint64_t> last_real{0};
+        static std::atomic<uint32_t> count{0};
+        const uint64_t packed = (uint64_t)(uint32_t)real_w << 32 | (uint32_t)real_h;
+        if (last_real.exchange(packed) != packed && count.fetch_add(1) < 100) {
+            spdlog::info("[EDAY-DIAG][ClientRect] real client {}x{} -> reported to the game {}x{}", real_w, real_h,
+                         rect->right - rect->left, real_h);
+        }
     }
     return ok;
 }
