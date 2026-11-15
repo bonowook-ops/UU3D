@@ -2691,9 +2691,13 @@ uint32_t sw_zero_company_flat3d_ui_width(uint32_t width, uint32_t height) {
         return width;
     }
 
+    // Only the exact full side-by-side relation (output = 2 x perceived width,
+    // same height). Right after injection the swapchain still reports the
+    // pre-resize window size (e.g. 1928x1119 with its frame) for a moment;
+    // widening to that produced a mismatched UI target and a fatal copy.
     const uint32_t output_width = d3d12->get_display_width();
     const uint32_t output_height = d3d12->get_display_height();
-    if (output_height != height || output_width <= width) {
+    if (output_height != height || static_cast<uint64_t>(output_width) != static_cast<uint64_t>(width) * 2) {
         return width;
     }
 
@@ -38656,7 +38660,34 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
             g_hook->note_stable_slate_draw();
             g_hook->attempt_hook_ue55_slate_output_texture_register();
 
-            if (expected_extent) {
+            // Right after injection Flat3D's native output rewrites the window
+            // (frame removed, resized), and Slate can report the transient
+            // pre-resize window extent (e.g. 1928x1119) for a frame. A dedicated
+            // UI target created at that size mismatches everything that follows
+            // and ended in a fatal copy on full side-by-side output. Only act on
+            // an extent that has stayed the same for a short while.
+            static uint32_t s_swzc_slate_w{};
+            static uint32_t s_swzc_slate_h{};
+            static std::chrono::steady_clock::time_point s_swzc_slate_since{};
+            const auto slate_now = std::chrono::steady_clock::now();
+            if (expected_extent &&
+                (expected_extent->width != s_swzc_slate_w || expected_extent->height != s_swzc_slate_h))
+            {
+                s_swzc_slate_w = expected_extent->width;
+                s_swzc_slate_h = expected_extent->height;
+                s_swzc_slate_since = slate_now;
+            }
+            const bool slate_extent_settled =
+                expected_extent && slate_now - s_swzc_slate_since >= std::chrono::milliseconds(500);
+
+            if (expected_extent && !slate_extent_settled) {
+                SPDLOG_INFO_EVERY_N_SEC(
+                    1,
+                    "[SWZeroCompany][UE5.6][SlateUI] Slate extent [{}x{}] changed; waiting for it to settle before "
+                    "creating the dedicated UI target",
+                    expected_extent->width,
+                    expected_extent->height);
+            } else if (expected_extent) {
                 SPDLOG_INFO_EVERY_N_SEC(
                     2,
                     "[SWZeroCompany][UE5.6][SlateUI] trusted Slate extent [{}x{}]; preparing dedicated UI redirection",
