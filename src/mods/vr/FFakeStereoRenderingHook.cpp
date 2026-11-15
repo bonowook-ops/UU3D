@@ -3017,13 +3017,18 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     const uint32_t trusted_desktop_height =
         static_cast<uint32_t>(trusted_desktop_extent);
 
+    // The destination is not required to match the trusted desktop extent. On a
+    // full side-by-side display (e.g. 3840x1080 glasses) the engine renders one
+    // eye at the desktop height and issues this copy into a one-eye-sized
+    // target, before any desktop extent has been observed (0x0) and possibly
+    // into a target that never matches it. A box larger than its destination is
+    // rejected by D3D12 in every case, so clamping it can only turn a fatal
+    // command-list error into a valid copy. The source checks below still pin
+    // the copy to the packed-HMD present.
     const bool exact_invalid_present_copy =
-        trusted_desktop_width != 0 && trusted_desktop_height != 0 &&
         src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         src_desc.Width == packed_width && src_desc.Height == packed_height &&
-        dst_desc.Width == trusted_desktop_width &&
-        dst_desc.Height == trusted_desktop_height &&
         // Height may be equal: on a flat 3D display (UU3D Flat3D) each eye is
         // rendered at the desktop height, so the packed source is wider but
         // not taller, and the full-box copy is just as invalid.
@@ -3052,11 +3057,14 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     *reinterpret_cast<const D3D12_BOX**>(ctx.rsp + src_box_stack_offset) = &clamped_box;
 
     SPDLOG_INFO_ONCE(
-        "[SWZeroCompany][UE5.6][DX12Copy] Clamped the validated packed-HMD to desktop copy from {}x{} to {}x{}",
+        "[SWZeroCompany][UE5.6][DX12Copy] Clamped the validated packed-HMD to desktop copy from {}x{} to {}x{} "
+        "(trusted desktop {}x{})",
         src_desc.Width,
         src_desc.Height,
         desktop_width,
-        desktop_height);
+        desktop_height,
+        trusted_desktop_width,
+        trusted_desktop_height);
 }
 
 bool sw_zero_company_ue56_install_copy_texture_region_hook() {
