@@ -2664,6 +2664,50 @@ bool sw_zero_company_ue56_is_current_game() {
     return result;
 }
 
+// Flat3D Native Render + Upscale (full side-by-side output such as 3840x1080
+// glasses): the engine is told its window is half the output width, so Slate
+// lays the UI out at 1920 wide, but it still rasterizes across the full-width
+// output (3840). A dedicated UI target of the perceived 1920 width therefore
+// receives the whole UI squeezed into its left half. Keep the dedicated UI
+// target at the full output width so the UI lands unsqueezed in the top-left
+// region that the Flat3D compositor crops (ui_topleft_crop). Every other
+// output, and every other game, keeps the requested extent.
+uint32_t sw_zero_company_flat3d_ui_width(uint32_t width, uint32_t height) {
+    if (!sw_zero_company_ue56_is_current_game() || width == 0 || height == 0) {
+        return width;
+    }
+
+    auto& vr = VR::get();
+    if (vr == nullptr || !vr->is_using_flat3d() || !vr->flat3d_is_full_sbs()) {
+        return width;
+    }
+
+    if (g_framework == nullptr) {
+        return width;
+    }
+
+    const auto& d3d12 = g_framework->get_d3d12_hook();
+    if (d3d12 == nullptr) {
+        return width;
+    }
+
+    // Only the exact full side-by-side relation (output = 2 x perceived width,
+    // same height). Right after injection the swapchain still reports the
+    // pre-resize window size (e.g. 1928x1119 with its frame) for a moment;
+    // widening to that produced a mismatched UI target and a fatal copy.
+    const uint32_t output_width = d3d12->get_display_width();
+    const uint32_t output_height = d3d12->get_display_height();
+    if (output_height != height || static_cast<uint64_t>(output_width) != static_cast<uint64_t>(width) * 2) {
+        return width;
+    }
+
+    SPDLOG_INFO_ONCE(
+        "[SWZeroCompany][UE5.6][Flat3D] Full side-by-side output: dedicated UI target widened from {}x{} to the "
+        "{}x{} output so the half-width Slate layout is not squeezed",
+        width, height, output_width, output_height);
+    return output_width;
+}
+
 bool bodycam_ue554_is_current_game() {
     static const bool result = []() {
         const auto executable = utility::get_executable();
@@ -3017,14 +3061,22 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     const uint32_t trusted_desktop_height =
         static_cast<uint32_t>(trusted_desktop_extent);
 
+    // The destination is not required to match the trusted desktop extent. On a
+    // full side-by-side display (e.g. 3840x1080 glasses) the engine renders one
+    // eye at the desktop height and issues this copy into a one-eye-sized
+    // target, before any desktop extent has been observed (0x0) and possibly
+    // into a target that never matches it. A box larger than its destination is
+    // rejected by D3D12 in every case, so clamping it can only turn a fatal
+    // command-list error into a valid copy. The source checks below still pin
+    // the copy to the packed-HMD present.
     const bool exact_invalid_present_copy =
-        trusted_desktop_width != 0 && trusted_desktop_height != 0 &&
         src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         src_desc.Width == packed_width && src_desc.Height == packed_height &&
-        dst_desc.Width == trusted_desktop_width &&
-        dst_desc.Height == trusted_desktop_height &&
-        src_desc.Width > dst_desc.Width && src_desc.Height > dst_desc.Height &&
+        // Height may be equal: on a flat 3D display (UU3D Flat3D) each eye is
+        // rendered at the desktop height, so the packed source is wider but
+        // not taller, and the full-box copy is just as invalid.
+        src_desc.Width > dst_desc.Width && src_desc.Height >= dst_desc.Height &&
         src_desc.DepthOrArraySize == 1 && dst_desc.DepthOrArraySize == 1 &&
         src_desc.MipLevels == 1 && dst_desc.MipLevels == 1 &&
         src_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
@@ -3049,11 +3101,14 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     *reinterpret_cast<const D3D12_BOX**>(ctx.rsp + src_box_stack_offset) = &clamped_box;
 
     SPDLOG_INFO_ONCE(
-        "[SWZeroCompany][UE5.6][DX12Copy] Clamped the validated packed-HMD to desktop copy from {}x{} to {}x{}",
+        "[SWZeroCompany][UE5.6][DX12Copy] Clamped the validated packed-HMD to desktop copy from {}x{} to {}x{} "
+        "(trusted desktop {}x{})",
         src_desc.Width,
         src_desc.Height,
         desktop_width,
-        desktop_height);
+        desktop_height,
+        trusted_desktop_width,
+        trusted_desktop_height);
 }
 
 bool sw_zero_company_ue56_install_copy_texture_region_hook() {
@@ -7473,6 +7528,49 @@ bool ue55_dx12_try_get_native_resource_direct(
     return false;
 }
 
+bool sw_zero_company_flat3d_native_resource_impl(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                                 ID3D12Resource*& out_native)
+{
+    out_native = nullptr;
+
+    if (!sw_zero_company_ue56_is_current_game() || !is_ue_5_6_dx12_backend()) {
+        return false;
+    }
+
+    if (texture == nullptr) {
+        return true;
+    }
+
+    if (is_ui_target && g_hook != nullptr) {
+        if (auto* const rtm = g_hook->get_render_target_manager(); rtm != nullptr) {
+            ID3D12Resource* pinned{};
+            if (rtm->try_get_sw_zero_company_pinned_ui_resource(texture, pinned)) {
+                out_native = pinned;
+                return true;
+            }
+        }
+    }
+
+    // Only the byte-validated slot-5 accessor; never a blind slot probe.
+    const auto* const layout = sw_zero_company_ue56_binary_layout();
+    if (layout == nullptr || layout->native_resource == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(5,
+            "[SWZeroCompany][UE5.6][Flat3D] No validated GetNativeResource layout for {}; not probing tex={:x}",
+            source != nullptr ? source : "<unknown>", reinterpret_cast<uintptr_t>(texture));
+        return true;
+    }
+
+    ID3D12Resource* native{};
+    if (ue55_dx12_try_get_native_resource_direct(texture, source, &native, nullptr)) {
+        out_native = native;
+    }
+
+    SPDLOG_INFO_ONCE(
+        "[SWZeroCompany][UE5.6][Flat3D] Using the validated GetNativeResource accessor for Flat3D output; "
+        "the SDK's generic slot discovery is not used");
+    return true;
+}
+
 constexpr std::string_view BODYCAM_UE554_SCENE_VIEWPORT_SOURCE =
     "Bodycam FSceneViewport::InitRHI post";
 
@@ -9673,6 +9771,15 @@ std::optional<uint32_t> resolve_post_init_properties_index_from_uobject(uintptr_
     SPDLOG_WARN("[PostInitProperties] Could not validate the expected UObject::PostInitProperties slots on this build");
     return std::nullopt;
 }
+}
+
+// External entry point (declared in FFakeStereoRenderingHook.hpp) for the
+// Flat3D output path; the implementation lives in this file's anonymous
+// namespace next to the validated accessor it uses.
+bool sw_zero_company_flat3d_native_resource(FRHITexture2D* texture, const char* source, bool is_ui_target,
+                                            ID3D12Resource*& out_native)
+{
+    return sw_zero_company_flat3d_native_resource_impl(texture, source, is_ui_target, out_native);
 }
 
 namespace {
@@ -38501,6 +38608,81 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
         const bool valid_extent = width > 0 && width <= 16384 && height > 0 && height <= 16384;
         const auto vr = VR::get();
         auto* const rtm = g_hook->get_render_target_manager();
+
+        // eday-diag1 (observation only, no behavior change): what Slate itself
+        // is told to draw with - the scene view rect, the UI scale, and the raw
+        // FViewportInfo (holds Slate's projection matrix and its own
+        // width/height). Logged on change, at most once per second.
+        {
+            constexpr size_t dump_size = 0x140;
+            static uint8_t last_dump[dump_size]{};
+            static bool have_dump = false;
+            static UE55FIntRect last_rect{};
+            static float last_scale = -1.0f;
+            static void* last_viewport_info = nullptr;
+            static void* last_window = nullptr;
+            static uint32_t dump_count = 0;
+            static std::chrono::steady_clock::time_point last_dump_time{};
+
+            uint8_t dump[dump_size]{};
+            const auto viewport_info_address = reinterpret_cast<uintptr_t>(ue55_inputs_full.viewport_info);
+            const bool dump_ok = is_readable_process_range(viewport_info_address, dump_size);
+            if (dump_ok) {
+                memcpy(dump, reinterpret_cast<const void*>(viewport_info_address), dump_size);
+            }
+
+            const bool changed =
+                memcmp(&last_rect, &ue55_inputs_full.scene_view_rect, sizeof(last_rect)) != 0 ||
+                last_scale != ue55_inputs_full.viewport_scale_ui ||
+                last_viewport_info != ue55_inputs_full.viewport_info ||
+                last_window != ue55_inputs_full.window ||
+                (dump_ok && (!have_dump || memcmp(last_dump, dump, dump_size) != 0));
+            const auto now = std::chrono::steady_clock::now();
+
+            if (changed && dump_count < 300 && now - last_dump_time >= std::chrono::seconds(1)) {
+                ++dump_count;
+                last_dump_time = now;
+                last_rect = ue55_inputs_full.scene_view_rect;
+                last_scale = ue55_inputs_full.viewport_scale_ui;
+                last_viewport_info = ue55_inputs_full.viewport_info;
+                last_window = ue55_inputs_full.window;
+                if (dump_ok) {
+                    memcpy(last_dump, dump, dump_size);
+                    have_dump = true;
+                }
+
+                std::string words{};
+                if (dump_ok) {
+                    for (size_t i = 0; i + sizeof(uint32_t) <= dump_size; i += sizeof(uint32_t)) {
+                        uint32_t word{};
+                        memcpy(&word, dump + i, sizeof(word));
+                        words += fmt::format("{:08x} ", word);
+                    }
+                } else {
+                    words = "unreadable";
+                }
+
+                SPDLOG_INFO(
+                    "[EDAY-DIAG][Slate] #{} window={:x} viewport_info={:x} scene_view_rect=({},{})-({},{}) [{}x{}] "
+                    "viewport_scale_ui={} cursor=({},{}) rtm_dedicated_ui=[{}x{}]",
+                    dump_count,
+                    reinterpret_cast<uintptr_t>(ue55_inputs_full.window),
+                    viewport_info_address,
+                    ue55_inputs_full.scene_view_rect.min.x,
+                    ue55_inputs_full.scene_view_rect.min.y,
+                    ue55_inputs_full.scene_view_rect.max.x,
+                    ue55_inputs_full.scene_view_rect.max.y,
+                    width,
+                    height,
+                    ue55_inputs_full.viewport_scale_ui,
+                    ue55_inputs_full.cursor_position.x,
+                    ue55_inputs_full.cursor_position.y,
+                    rtm != nullptr ? rtm->get_dedicated_ui_width() : 0,
+                    rtm != nullptr ? rtm->get_dedicated_ui_height() : 0);
+                SPDLOG_INFO("[EDAY-DIAG][Slate] #{} FViewportInfo raw u32[0x{:x}]: {}", dump_count, dump_size, words);
+            }
+        }
+
         if (vr != nullptr && vr->is_hmd_active() && !vr->is_stereo_emulation_enabled() &&
             !vr->is_extreme_compatibility_mode_enabled() && rtm != nullptr && valid_extent)
         {
@@ -38553,7 +38735,34 @@ void* FFakeStereoRenderingHook::slate_draw_window_render_thread(void* renderer, 
             g_hook->note_stable_slate_draw();
             g_hook->attempt_hook_ue55_slate_output_texture_register();
 
-            if (expected_extent) {
+            // Right after injection Flat3D's native output rewrites the window
+            // (frame removed, resized), and Slate can report the transient
+            // pre-resize window extent (e.g. 1928x1119) for a frame. A dedicated
+            // UI target created at that size mismatches everything that follows
+            // and ended in a fatal copy on full side-by-side output. Only act on
+            // an extent that has stayed the same for a short while.
+            static uint32_t s_swzc_slate_w{};
+            static uint32_t s_swzc_slate_h{};
+            static std::chrono::steady_clock::time_point s_swzc_slate_since{};
+            const auto slate_now = std::chrono::steady_clock::now();
+            if (expected_extent &&
+                (expected_extent->width != s_swzc_slate_w || expected_extent->height != s_swzc_slate_h))
+            {
+                s_swzc_slate_w = expected_extent->width;
+                s_swzc_slate_h = expected_extent->height;
+                s_swzc_slate_since = slate_now;
+            }
+            const bool slate_extent_settled =
+                expected_extent && slate_now - s_swzc_slate_since >= std::chrono::milliseconds(500);
+
+            if (expected_extent && !slate_extent_settled) {
+                SPDLOG_INFO_EVERY_N_SEC(
+                    1,
+                    "[SWZeroCompany][UE5.6][SlateUI] Slate extent [{}x{}] changed; waiting for it to settle before "
+                    "creating the dedicated UI target",
+                    expected_extent->width,
+                    expected_extent->height);
+            } else if (expected_extent) {
                 SPDLOG_INFO_EVERY_N_SEC(
                     2,
                     "[SWZeroCompany][UE5.6][SlateUI] trusted Slate extent [{}x{}]; preparing dedicated UI redirection",
@@ -42755,6 +42964,8 @@ void VRRenderTargetManager_Base::request_dedicated_ui_target(uint32_t width, uin
         return;
     }
 
+    width = sw_zero_company_flat3d_ui_width(width, height);
+
     if (ue58_ui_initialization_enabled.load(std::memory_order_acquire)) {
         ue58_ui_initialization.cancel_if(
             [&] { return dedicated_ui_width != width || dedicated_ui_height != height; },
@@ -44143,11 +44354,27 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
     } else if (sdk::kh3::is_process() && g_framework->is_dx11() && VR::get()->is_native_stereo_fix_enabled()) {
         tgt_raw = create_kh3_native_capture_target(ugs, world, target_width, target_height);
     } else if (kismet_rendering != nullptr) {
+        // ETextureRenderTargetFormat: 2 = RTF_RGBA8 (BGRA8), 10 = RTF_RGB10A2.
+        // SW Zero Company keeps its scene target in R10G10B10A2, and the Flat3D
+        // compositor copies this capture (the right eye under Native Stereo
+        // Fix) straight into an eye cache of the scene's format. A BGRA8
+        // capture makes that CopyTextureRegion cross-format, so every
+        // compositor command list fails Close() with E_INVALIDARG.
+        // Match the scene's format there; every other game/output keeps RGBA8.
+        constexpr uint8_t rtf_rgba8 = 2;
+        constexpr uint8_t rtf_rgb10a2 = 10;
+        const bool swzc_flat3d_capture =
+            sw_zero_company_ue56_is_current_game() && VR::get()->is_using_flat3d();
+        if (swzc_flat3d_capture) {
+            SPDLOG_INFO_ONCE(
+                "[SWZeroCompany][UE5.6][Flat3D] Creating the Native Stereo Fix scene capture as RTF_RGB10A2 to match "
+                "the R10G10B10A2 scene target");
+        }
         tgt_raw = kismet_rendering->create_render_target_2d(
             world,
             target_width,
             target_height,
-            2,
+            swzc_flat3d_capture ? rtf_rgb10a2 : rtf_rgba8,
             clear_color,
             false);
     } else {
