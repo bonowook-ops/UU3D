@@ -3031,13 +3031,30 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     const uint64_t packed_width = static_cast<uint64_t>(vr->get_hmd_width()) * 2;
     const uint32_t packed_height = vr->get_hmd_height();
 
+    // The packed size of the last copy this hook clamped. When the eye size
+    // changes at runtime (e.g. switching Flat3D output to Katanga resizes the
+    // window 3840x2160 -> 3834x2143 and the eyes to 3834x2142), the HMD size
+    // updates a few frames before the engine reallocates its packed scene
+    // target, so the engine keeps issuing the old full-box copy (7680x2160)
+    // into the new, smaller desktop target. Accepting the previously clamped
+    // packed size covers exactly that window.
+    static std::atomic<uint64_t> s_last_clamped_packed{0};
+    const uint64_t last_clamped_packed = s_last_clamped_packed.load(std::memory_order_relaxed);
+    const uint64_t last_packed_width = last_clamped_packed >> 32;
+    const uint32_t last_packed_height = static_cast<uint32_t>(last_clamped_packed);
+
+    const bool box_is_current_packed =
+        packed_width != 0 && packed_height != 0 &&
+        src_box->right == packed_width && src_box->bottom == packed_height;
+    const bool box_is_last_clamped_packed =
+        last_packed_width != 0 && last_packed_height != 0 &&
+        src_box->right == last_packed_width && src_box->bottom == last_packed_height;
+
     // Reject normal engine copies before touching either COM resource. The
     // invalid transaction is uniquely a full packed-HMD box into the smaller
     // desktop target at the origin.
-    if (packed_width == 0 || packed_height == 0 ||
-        src_box->left != 0 || src_box->top != 0 || src_box->front != 0 ||
-        src_box->right != packed_width ||
-        src_box->bottom != packed_height ||
+    if (src_box->left != 0 || src_box->top != 0 || src_box->front != 0 ||
+        (!box_is_current_packed && !box_is_last_clamped_packed) ||
         src_box->back != 1)
     {
         return;
@@ -3072,11 +3089,15 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     const bool exact_invalid_present_copy =
         src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
-        src_desc.Width == packed_width && src_desc.Height == packed_height &&
-        // Height may be equal: on a flat 3D display (UU3D Flat3D) each eye is
-        // rendered at the desktop height, so the packed source is wider but
-        // not taller, and the full-box copy is just as invalid.
-        src_desc.Width > dst_desc.Width && src_desc.Height >= dst_desc.Height &&
+        // The box (current or last clamped packed size, checked above) must be
+        // the whole source, i.e. the source is that packed scene target.
+        src_desc.Width == src_box->right && src_desc.Height == src_box->bottom &&
+        // Only the width has to overflow. On a flat 3D display (UU3D Flat3D)
+        // each eye is rendered at about the desktop height, so the packed
+        // source may be equal, or (Katanga window: eyes 3834x2142 into a
+        // 3834x2143 backbuffer) one row shorter; the box height is clamped to
+        // the smaller of the two below.
+        src_desc.Width > dst_desc.Width &&
         src_desc.DepthOrArraySize == 1 && dst_desc.DepthOrArraySize == 1 &&
         src_desc.MipLevels == 1 && dst_desc.MipLevels == 1 &&
         src_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM &&
@@ -3097,8 +3118,17 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     thread_local D3D12_BOX clamped_box{};
     clamped_box = *src_box;
     clamped_box.right = desktop_width;
-    clamped_box.bottom = desktop_height;
+    clamped_box.bottom = (std::min)(desktop_height, static_cast<uint32_t>(src_desc.Height));
     *reinterpret_cast<const D3D12_BOX**>(ctx.rsp + src_box_stack_offset) = &clamped_box;
+
+    s_last_clamped_packed.store((src_desc.Width << 32) | src_desc.Height, std::memory_order_relaxed);
+
+    if (!box_is_current_packed) {
+        SPDLOG_INFO_ONCE(
+            "[SWZeroCompany][UE5.6][DX12Copy] Clamped a stale packed copy during an eye resize: {}x{} -> {}x{} "
+            "(eyes now {}x{})",
+            src_desc.Width, src_desc.Height, desktop_width, desktop_height, packed_width / 2, packed_height);
+    }
 
     SPDLOG_INFO_ONCE(
         "[SWZeroCompany][UE5.6][DX12Copy] Clamped the validated packed-HMD to desktop copy from {}x{} to {}x{} "
