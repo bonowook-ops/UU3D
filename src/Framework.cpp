@@ -408,6 +408,9 @@ Framework::Framework(HMODULE framework_module)
     // Flushing every info line to disk turns that into visible hitching and input lag.
     // Keep immediate flushing for actual errors only.
     spdlog::flush_on(spdlog::level::err);
+    // katanga-diag1 (diagnostic build only): keep the on-disk log at most
+    // 250 ms behind, so the lines before a fatal engine assert survive.
+    spdlog::flush_every(std::chrono::milliseconds(250));
     spdlog::info("UnrealVR entry");
 
     // Effective process DPI awareness — per-monitor is REQUIRED for pixel-exact

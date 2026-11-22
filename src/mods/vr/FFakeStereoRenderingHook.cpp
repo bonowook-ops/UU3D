@@ -2977,6 +2977,79 @@ void sw_zero_company_ue56_nanite_dispatch_base_pass_hook(
         vr->is_native_stereo_fix_enabled());
 }
 
+// SWZC katanga-diag1 (observation only, no behavior change): log every engine
+// CopyTextureRegion whose box does not fit its source or destination, or whose
+// formats differ, with all inputs the packed-present clamp decides on. Each log
+// line is flushed at once because the fatal E_INVALIDARG follows within frames
+// and a release build otherwise loses the last seconds of the log.
+void swzc_katanga_diag_check_copy(const safetyhook::Context& ctx,
+                                  const D3D12_TEXTURE_COPY_LOCATION* dst_location,
+                                  const D3D12_TEXTURE_COPY_LOCATION* src_location,
+                                  const D3D12_BOX* src_box,
+                                  uint32_t dst_z)
+{
+    static std::atomic<uint32_t> s_logged{0};
+    if (s_logged.load(std::memory_order_relaxed) >= 200) {
+        return;
+    }
+    if (dst_location == nullptr || src_location == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(dst_location), sizeof(*dst_location)) ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(src_location), sizeof(*src_location)) ||
+        (src_box != nullptr && !is_readable_process_range(reinterpret_cast<uintptr_t>(src_box), sizeof(*src_box))) ||
+        dst_location->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ||
+        src_location->Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX ||
+        dst_location->pResource == nullptr || src_location->pResource == nullptr)
+    {
+        return;
+    }
+
+    D3D12_RESOURCE_DESC dst_desc{};
+    D3D12_RESOURCE_DESC src_desc{};
+    if (!get_d3d12_resource_desc_guarded(dst_location->pResource, dst_desc) ||
+        !get_d3d12_resource_desc_guarded(src_location->pResource, src_desc) ||
+        dst_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+        src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+    {
+        return;
+    }
+
+    const uint32_t dst_x = static_cast<uint32_t>(ctx.r8);
+    const uint32_t dst_y = static_cast<uint32_t>(ctx.r9);
+    const uint64_t box_l = src_box != nullptr ? src_box->left : 0;
+    const uint64_t box_t = src_box != nullptr ? src_box->top : 0;
+    const uint64_t box_r = src_box != nullptr ? src_box->right : src_desc.Width;
+    const uint64_t box_b = src_box != nullptr ? src_box->bottom : src_desc.Height;
+    const uint64_t copy_w = box_r > box_l ? box_r - box_l : 0;
+    const uint64_t copy_h = box_b > box_t ? box_b - box_t : 0;
+
+    const bool src_oob = box_r > src_desc.Width || box_b > src_desc.Height;
+    const bool dst_oob = dst_x + copy_w > dst_desc.Width || dst_y + copy_h > dst_desc.Height;
+    const bool fmt_diff = src_desc.Format != dst_desc.Format;
+    if (!src_oob && !dst_oob && !fmt_diff) {
+        return;
+    }
+
+    const auto vr = VR::get();
+    const auto* const rtm = g_hook != nullptr ? g_hook->get_render_target_manager() : nullptr;
+    const auto trusted = rtm != nullptr ? rtm->get_sw_zero_company_desktop_extent() : 0;
+    const uint32_t n = s_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+    spdlog::warn(
+        "[SWZC katanga-diag1] #{} copy{}{}{} box=({},{})-({},{}) box_ptr={} dst_xyz=({},{},{}) "
+        "src={}x{} fmt{} flags{:#x} mips{} arr{} smp{}/{} | dst={}x{} fmt{} flags{:#x} mips{} arr{} smp{}/{} "
+        "src_sub={} dst_sub={} | hmd={}x{} active={} trusted={}x{} mode={} tid={}",
+        n, src_oob ? " SRC_OOB" : "", dst_oob ? " DST_OOB" : "", fmt_diff ? " FMT_DIFF" : "",
+        box_l, box_t, box_r, box_b, src_box != nullptr, dst_x, dst_y, dst_z,
+        src_desc.Width, src_desc.Height, (int)src_desc.Format, (uint32_t)src_desc.Flags, src_desc.MipLevels,
+        src_desc.DepthOrArraySize, src_desc.SampleDesc.Count, src_desc.SampleDesc.Quality,
+        dst_desc.Width, dst_desc.Height, (int)dst_desc.Format, (uint32_t)dst_desc.Flags, dst_desc.MipLevels,
+        dst_desc.DepthOrArraySize, dst_desc.SampleDesc.Count, dst_desc.SampleDesc.Quality,
+        src_location->SubresourceIndex, dst_location->SubresourceIndex,
+        vr != nullptr ? vr->get_hmd_width() : 0, vr != nullptr ? vr->get_hmd_height() : 0,
+        vr != nullptr && vr->is_hmd_active(), (uint32_t)(trusted >> 32), (uint32_t)trusted,
+        vr != nullptr ? vr->flat3d_output_mode_value() : -1, GetCurrentThreadId());
+    spdlog::default_logger()->flush();
+}
+
 void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     if (g_framework == nullptr ||
         !g_framework->is_dx12() ||
@@ -3004,6 +3077,8 @@ void sw_zero_company_ue56_copy_texture_region_hook(safetyhook::Context& ctx) {
     const auto* const src_box =
         *reinterpret_cast<const D3D12_BOX* const*>(ctx.rsp + src_box_stack_offset);
     const auto dst_z = *reinterpret_cast<const uint32_t*>(ctx.rsp + dst_z_stack_offset);
+
+    swzc_katanga_diag_check_copy(ctx, dst_location, src_location, src_box, dst_z);
 
     if (dst_location == nullptr || src_location == nullptr || src_box == nullptr ||
         !is_readable_process_range(reinterpret_cast<uintptr_t>(dst_location), sizeof(*dst_location)) ||
