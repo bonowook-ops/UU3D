@@ -3029,12 +3029,26 @@ void swzc_katanga_diag_check_copy(const safetyhook::Context& ctx,
         return;
     }
 
+    // katanga-diag2: log each distinct copy shape at most 4 times, so the
+    // repeating (clamped) present copy cannot use up the budget.
+    {
+        static std::mutex s_sig_mutex;
+        static std::unordered_map<uint64_t, uint32_t> s_sig_counts;
+        const uint64_t sig = (box_r * 0x9E3779B97F4A7C15ull) ^ (box_b << 1) ^ (src_desc.Width << 17) ^
+                             ((uint64_t)src_desc.Height << 33) ^ (dst_desc.Width << 7) ^ ((uint64_t)dst_desc.Height << 45) ^
+                             ((uint64_t)src_desc.Format << 56) ^ ((uint64_t)dst_desc.Format << 60);
+        std::scoped_lock sig_lock{s_sig_mutex};
+        if (++s_sig_counts[sig] > 4) {
+            return;
+        }
+    }
+
     const auto vr = VR::get();
     const auto* const rtm = g_hook != nullptr ? g_hook->get_render_target_manager() : nullptr;
     const auto trusted = rtm != nullptr ? rtm->get_sw_zero_company_desktop_extent() : 0;
     const uint32_t n = s_logged.fetch_add(1, std::memory_order_relaxed) + 1;
     spdlog::warn(
-        "[SWZC katanga-diag1] #{} copy{}{}{} box=({},{})-({},{}) box_ptr={} dst_xyz=({},{},{}) "
+        "[SWZC katanga-diag2] #{} copy{}{}{} box=({},{})-({},{}) box_ptr={} dst_xyz=({},{},{}) "
         "src={}x{} fmt{} flags{:#x} mips{} arr{} smp{}/{} | dst={}x{} fmt{} flags{:#x} mips{} arr{} smp{}/{} "
         "src_sub={} dst_sub={} | hmd={}x{} active={} trusted={}x{} mode={} tid={}",
         n, src_oob ? " SRC_OOB" : "", dst_oob ? " DST_OOB" : "", fmt_diff ? " FMT_DIFF" : "",
