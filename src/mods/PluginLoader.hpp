@@ -110,7 +110,7 @@ public:
             std::unique_lock lock{ m_ufunction_hooks_mtx };
 
             for (auto& [_, hook] : m_ufunction_hooks) {
-                std::scoped_lock _{hook->mux};
+                std::scoped_lock hook_lock{hook->mux};
                 std::erase_if(hook->pre_callbacks, [cb](auto& cb_func) {
                     return (void*)cb_func == cb;
                 });
