@@ -1251,9 +1251,14 @@ vr::EVRCompositorError D3D12Component::on_frame_flat3d(VR* vr) {
     }
 
     // Stupid Never Dies: tell the viewport-quad skip which texture is the
-    // routed Slate UI target (no-op for every other game).
-    flat3d::snd_viewport_skip::on_present(
-        ui_target != nullptr ? (ID3D12Resource*)ui_target->get_native_resource() : nullptr);
+    // routed Slate UI target. Other games must not even evaluate the generic
+    // get_native_resource() here: on Zero Company (UE5.6 D3D12) that probe
+    // calls vtable slot 4 with a bad hidden-return pointer and the RHI thread
+    // spins on the resulting access violation forever (frozen game).
+    if (flat3d::snd_viewport_skip::enabled()) {
+        flat3d::snd_viewport_skip::on_present(
+            ui_target != nullptr ? (ID3D12Resource*)ui_target->get_native_resource() : nullptr);
+    }
 
     const bool composited = m_flat3d_compositor.composite(double_wide.Get(), second_eye_src, ui_tex, menu_tex,
                                        real_backbuffer.Get(), (uint32_t)bb_desc.Width, bb_desc.Height, params,
